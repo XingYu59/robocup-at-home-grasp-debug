@@ -1,0 +1,40 @@
+# GraspFixedObject.srv
+#
+# 抓取触发服务 —— 由 grasp_node 提供，由编排节点（dining_grasp_task.py）调用。
+#
+# ── 调用时机 ────────────────────────────────────────────────────────
+#   机器人已导航到固定站位、底盘停稳，并且已经从视觉服务 DetectGraspTarget
+#   取回本次要抓的目标之后，调用本服务。
+#
+# ── 本服务只做两件事 ────────────────────────────────────────────────
+#   1) 触发一次抓取（一进一出，不重入：忙时返回 STAGE_BUSY）；
+#   2) 把视觉目标【透传】给 grasp_node —— 用什么帧都可以（视觉侧现在给 "map"）。
+#
+# ── 这里【不】传的东西 ──────────────────────────────────────────────
+#   * 碰撞箱尺寸：由 target.class_id 查 objects.yaml 得到（抓取侧负责）；
+#   * 规划帧下的位姿：由 grasp_node 自己做 TF(map → base_footprint)、
+#     并算出碰撞箱中心（语义见 msg/GraspTargetStamped.msg）；
+#   * 抓取/放置调参：走 grasp_node 的 ROS 参数（YAML），不进这个请求。
+
+GraspTargetStamped target   # 本次要抓的目标（必填；语义见 msg/GraspTargetStamped.msg）
+GraspTargetStamped[] obstacles  # 选填：桌上其它已识别到的物品（本次不抓，但要当障碍物）
+                                # 直接填 DetectGraspTarget 返回数组里除 target 之外的项即可。
+                                # 规则书场景是桌上并排四个物品，把其余几个也放进规划场景，
+                                # MTC 才会主动绕开它们（上一版"一头扎进碗里"就是这个原因）。
+
+---
+# ── 结果 ────────────────────────────────────────────────────────────
+# stage 取值 —— 与 C++ 侧 GraspStage（include/.../grasp_types.hpp）一一对应，
+# 改一处必须改两处。编排层按 stage 决定「重试 / 换站 / 报错」。
+uint8 STAGE_OK=0            # 规划+执行都成功
+uint8 STAGE_NO_TARGET=1     # 没有可用目标（视觉没给 / 数据过旧 / target 为空）
+uint8 STAGE_BAD_TARGET=2    # 目标不合法（不在支撑面上、超出可达范围、类别查不到表…）
+uint8 STAGE_SCENE_FAILED=3  # 场景没建起来（move_group 未就绪 / TF 失败）
+uint8 STAGE_INIT_FAILED=4   # MTC 任务建不起来（组名 / 命名状态 / IK 帧等配置问题）
+uint8 STAGE_NO_SOLUTION=5   # 场景正常但规划无解
+uint8 STAGE_EXEC_FAILED=6   # 求出解但执行失败（控制器未就绪 / 碰撞中止）
+uint8 STAGE_BUSY=7          # 已有抓取正在执行（重入保护）
+
+bool success                # = (stage == STAGE_OK)，方便调用方直接判断
+uint8 stage                 # 见上
+string message              # 人类可读的原因/摘要，直接进日志

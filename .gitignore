@@ -1,21 +1,17 @@
-# colcon / ROS 构建产物
-build/
-install/
-log/
+# 大体积资产 / 第三方源码：不进仓库（用 download_weights.sh / 各自仓库获取）
+checkpoints.zip
+models.zip
+third_party/
+turtlebot3_manipulation_navigation2/scripts/checkpoints/
+moveit_task_constructor/
+wpr_simulation_assets/
 
-# Python
-__pycache__/
+# 调试运行的中间产物
+HANDOFF_harness/.run/
+**/__pycache__/
 *.pyc
-*.pyo
-
-# IDE
-.vscode/
-.idea/
-
-# 日志 / 临时文件
 *.log
-*.gv
+*.db3
 
-# 大模型权重（官方门控下载，不进 git；且 ~342MB 超过 GitHub 单文件 100MB 限制）
-# DINOv3 base 骨干：turtlebot3_manipulation_navigation2/scripts/checkpoints/
-**/checkpoints/
+# 地图/日志等本地产物
+map/*.png.bak

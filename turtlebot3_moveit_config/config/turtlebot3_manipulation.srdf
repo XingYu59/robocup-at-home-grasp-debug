@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Semantic robot description (SRDF) for TurtleBot3 Waffle Pi + FR3 arm.
+
+  - Only the FR3 arm is planned by MoveIt; the diff-drive base is driven by Nav2.
+  - Planning frame == root link == base_footprint (no virtual joint).
+  - fr3_finger_joint2 is a URDF <mimic> of fr3_finger_joint1 and is NOT
+    part of any group (MoveIt handles the mimic automatically).
+-->
+<robot name="turtlebot3_manipulation">
+
+  <!-- ══════════════ GROUPS ══════════════ -->
+
+  <group name="arm">
+    <chain base_link="base_link" tip_link="fr3_link8" />
+  </group>
+
+  <group name="hand">
+    <link name="fr3_hand" />
+    <link name="fr3_rightfinger" />
+    <joint name="fr3_finger_joint1" />
+  </group>
+
+  <!-- ══════════════ GROUP STATES ══════════════ -->
+
+  <!-- Folded transport pose (matches ros2_control initial values exactly). -->
+  <group_state name="home" group="arm">
+    <joint name="fr3_joint1" value="0.0" />
+    <joint name="fr3_joint2" value="-0.7853981634" />
+    <joint name="fr3_joint3" value="0.0" />
+    <joint name="fr3_joint4" value="-2.3561944902" />
+    <joint name="fr3_joint5" value="0.0" />
+    <joint name="fr3_joint6" value="1.5707963268" />
+    <joint name="fr3_joint7" value="0.7853981634" />
+  </group_state>
+
+  <group_state name="open" group="hand">
+    <joint name="fr3_finger_joint1" value="0.04" />
+  </group_state>
+
+  <group_state name="close" group="hand">
+    <joint name="fr3_finger_joint1" value="0.0" />
+  </group_state>
+
+  <!-- ══════════════ END EFFECTOR ══════════════ -->
+
+  <end_effector name="hand" parent_link="fr3_link8" group="hand" parent_group="arm" />
+
+  <!-- ══════════════ DISABLED COLLISIONS ══════════════
+       Adjacent link pairs + known "never in collision" pairs for the FR3 hand.
+       This is a focused set; the full Setup-Assistant-generated ACM can be
+       added later if extra false positives appear during planning. -->
+
+  <disable_collisions link1="base_link" link2="fr3_riser" reason="Adjacent" />
+  <disable_collisions link1="fr3_riser" link2="fr3_link0" reason="Adjacent" />
+  <!-- The riser column's fat collision cylinder overlaps the LiDAR's collision box
+       (both are fixed to base_link, so this is constant and must be disabled). -->
+  <disable_collisions link1="base_scan" link2="fr3_riser" reason="Never" />
+  <disable_collisions link1="fr3_link0" link2="fr3_link1" reason="Adjacent" />
+  <disable_collisions link1="fr3_link1" link2="fr3_link2" reason="Adjacent" />
+  <disable_collisions link1="fr3_link2" link2="fr3_link3" reason="Adjacent" />
+  <disable_collisions link1="fr3_link3" link2="fr3_link4" reason="Adjacent" />
+  <disable_collisions link1="fr3_link4" link2="fr3_link5" reason="Adjacent" />
+  <disable_collisions link1="fr3_link5" link2="fr3_link6" reason="Adjacent" />
+  <disable_collisions link1="fr3_link6" link2="fr3_link7" reason="Adjacent" />
+  <disable_collisions link1="fr3_link7" link2="fr3_link8" reason="Adjacent" />
+  <disable_collisions link1="fr3_link8" link2="fr3_hand" reason="Adjacent" />
+  <disable_collisions link1="fr3_hand" link2="fr3_leftfinger" reason="Adjacent" />
+  <disable_collisions link1="fr3_hand" link2="fr3_rightfinger" reason="Adjacent" />
+
+  <!-- Hand close to the wrist / fingers closing on each other: never collide. -->
+  <disable_collisions link1="fr3_hand" link2="fr3_link7" reason="Never" />
+  <disable_collisions link1="fr3_hand" link2="fr3_link6" reason="Never" />
+  <disable_collisions link1="fr3_hand" link2="fr3_link5" reason="Never" />
+  <disable_collisions link1="fr3_leftfinger" link2="fr3_rightfinger" reason="Never" />
+
+</robot>

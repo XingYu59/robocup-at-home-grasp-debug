@@ -1,0 +1,3 @@
+# 取证台自己产生的临时文件（日志、HOME、rsp.yaml）都放这里，不进 git
+.run/
+__pycache__/

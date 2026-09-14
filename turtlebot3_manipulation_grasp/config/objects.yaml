@@ -1,0 +1,180 @@
+# objects.yaml —— 物体目录表（class_id → 碰撞箱 + 抓取参数）
+#
+# 谁读它：grasp_node（适配器）在收到视觉目标后按 class_id 精确查表。
+# key 的取值规则：**照抄视觉侧 INSID3 闭集标签**（"coke can" 带空格 / "sugar_box" 带下划线
+# 都能匹配 —— 适配层归一化后再比较，见 detect_grasp_target_node.py:_classify_catalog）。
+#
+# 尺寸来源：本工程仿真 wpr_simulation_ros2/models/ 下的定义，不是估的：
+#   * <box><size>x y z</size> 或 <cylinder><radius>/<length> 直接读 SDF；
+#   * 网格类（apple/bowl/banana/coke_can）读 meshes/*.dae 顶点包围盒实测。
+# 单位 m。物体按出厂姿态放置时：height = 竖直(z)，depth = x，width = y。
+#
+# ══════════════════════════════════════════════════════════════════════════
+# grasp_lift：**指尖平面（fr3_hand_tcp）停在碰撞箱中心上方多少米**。
+#   顶抓（grasp_params.yaml: grasp_frame_transform = [0,0,grasp_lift, π,0,0]）下，
+#   手的前进轴竖直向下、指尖平面水平，两侧指腹（指尖平面 ±9 mm 那条窗）夹住物体。
+#
+#   ★ 取值方式（2026-09-14 定稿）：**由精确碰撞模型扫出的可行区间下沿**
+#     —— 即"手部不碰撞的前提下，夹持点能低到哪"，越低越靠近重心、越不容易被推倒。
+#     扫法：HANDOFF_harness/check_grasp_geometry.py
+#           （把整只手按目标位姿摆好，对 24 个采样角逐个做三角-盒精确相交测试，
+#             统计每个高度有多少个角可行；下表取"≥8 个角可行"的最低高度）
+#
+#   ★ 为什么不能"想当然地夹在重心"：手部（fr3_hand）碰撞网格的净空**随物体脚印宽度变化**
+#     （实测，指尖平面上方）：|y|<10 mm 中央槽 ~97 mm；0.010~0.046 完全空；
+#     0.070~0.090 ~40 mm；0.090~0.120 37.4 mm。
+#     连接这些区域的三角面斜着穿过掌心 → 物体越宽，能升得越低：
+#         coke can (半宽 34 mm)：物体顶面到 +92 mm 才不撞 → lift ≥ 0.026
+#         sugar_box(半宽 19 mm)：物体顶面到 +140 mm 才不撞 → lift ≥ 0.052
+#     所以"夹重心"对高物体大多做不到 ✗，只能取几何允许的最低高度 ✓
+#
+#   ★ 这些数只保证"能规划 + 尽量靠下"；**夹持能否成功还取决于合爪干涉量**
+#     （pick_and_place.cpp 里已改成按窄边成比例：固定 7 mm/指 对 38 mm 厚的盒子
+#      等于"每根手指要压进去 7 mm" → 刚性物体只能被挤走 ✗）
+# ══════════════════════════════════════════════════════════════════════════
+#
+# graspable：本夹爪（fr3_hand，开口 2×0.04 = 0.08 m）能不能夹。
+#   判据：min(depth, width) <= 0.075（留 5 mm 余量）→ true。
+#   交叉验证：几何自检脚本对 min(depth,width) > 0.075 的类别在**任何**高度上
+#   都找不到可行采样角（0/24）—— 与这条判据完全一致 ✓
+
+objects:
+  # ── 视觉侧词表覆盖的三类 ──────────────────────────────────
+  "apple":
+    height: 0.0724      # 网格实测 (0.0757 x 0.0749 x 0.0724)
+    depth: 0.0757
+    width: 0.0749
+    grasp_lift: 0.013   # ⚠ 只能夹到顶面下 23 mm：球直径 75 mm 太宽，夹低了球会撞到
+                        # 手部肩部三角面（≥8 角可行的最低是 0.046，但那里指腹已够不到球侧面）
+                        # 24 个采样角里只有 4 个（正对盒面）可行 ⚠
+    graspable: true
+
+  "coke can":
+    height: 0.1239      # 网格实测 (0.0670 x 0.0670 x 0.1239)；标称值 0.12/0.066
+    depth: 0.0670
+    width: 0.0670
+    grasp_lift: 0.026   # 由 0.040 降到 0.026（夹持点离重心 26 mm，比原来近 14 mm）
+                        # 方形足迹 → 24 个角里 12 个可行 ✓
+    graspable: true
+
+  "bowl":
+    height: 0.0544      # 网格实测 (0.1603 x 0.1574 x 0.0544)
+    depth: 0.1603
+    width: 0.1574
+    grasp_lift: 0.000   # 仅记录：不可夹，该值不参与抓取
+    graspable: false    # 直径 0.16 > 夹爪开口 0.08，本夹爪夹不住
+
+  "banana":
+    height: 0.0366      # 网格实测；长边 0.1984 超过夹爪开口(~0.08)，
+    depth: 0.1984       # 抓取朝向必须跨【宽 0.0750】那一对边
+    width: 0.0750
+    grasp_lift: 0.000   # 夹在中段 ✓（只有 2 个角可行：必须正对 0.075 那对边）⚠
+    graspable: true
+
+  # ── 仿真里存在的其它 YCB 物体（全部收录）─────────────────────────
+  # 为什么连夹不住的也写进来：grasp_node 对 obstacles 也会查表，**查不到就静默跳过** ✗
+  # → 桌上那些盒子不会被放进规划场景，机械臂可能一头撞上去。
+  # 所以"能不能夹"用 graspable 表达，而不是靠不写进表来回避。
+  # 尺寸与 wpr_simulation_ros2/models/*/model.sdf 的碰撞几何逐条核对过（14/14 一致）✓
+  "beer":
+    height: 0.2300
+    depth: 0.1100
+    width: 0.1100
+    grasp_lift: 0.023
+    graspable: false    # 窄边 0.110 > 开口，跨不过去（0/24 角可行）
+
+  "bleach_cleanser":
+    height: 0.2500
+    depth: 0.0980
+    width: 0.0650
+    grasp_lift: 0.088   # 25 cm 高瓶：几何允许的最低高度就是 0.088（离顶面 37 mm）
+    graspable: true     # 高瘦件：夹点离桌面 21 cm，有掀翻风险 ⚠
+
+  "chips_can":
+    height: 0.2500
+    depth: 0.0750
+    width: 0.0750
+    grasp_lift: 0.088   # 同上；方形足迹 → 4 个角可行 ⚠（窄边 0.075 贴开口上限）
+    graspable: true
+
+  "cracker_box":
+    height: 0.2100
+    depth: 0.0600
+    width: 0.1580
+    grasp_lift: 0.068   # 由 0.082 降到 0.068（离重心 37 mm）；必须跨 0.060 那对边 → 10 个角可行
+    graspable: true
+
+  "gelatin_box":
+    height: 0.0280
+    depth: 0.0730
+    width: 0.0850
+    grasp_lift: 0.000   # 只有 2.8 cm 高 → 下界由"指尖别插进桌面"定：指尖最低点在
+                        # 物体系 z = −9.5 mm、桌面在 −14 mm → 余量 4.5 mm ✓
+    graspable: true
+
+  "master_chef_can":
+    height: 0.1390
+    depth: 0.1020
+    width: 0.1020
+    grasp_lift: 0.000
+    graspable: false    # 窄边 0.102 > 开口（0/24 角可行）
+
+  "mustard_bottle":
+    height: 0.1900
+    depth: 0.0580
+    width: 0.0950
+    grasp_lift: 0.058   # 由 0.072 降到 0.058（离重心 37 mm）→ 10 个角可行 ✓
+    graspable: true     # （更早的 0.030 会让 MTC 0/25 全撞手掌；0.072 能规划但夹点偏上）
+
+  "pitcher_base":
+    height: 0.2350
+    depth: 0.1080
+    width: 0.1080
+    grasp_lift: 0.025
+    graspable: false    # 窄边 0.108 > 开口
+
+  "potted_meat_can":
+    height: 0.0820
+    depth: 0.0500
+    width: 0.0970
+    grasp_lift: 0.004   # 扁罐头 + 窄边 5 cm，10 个角可行 ✓（几乎夹在中段）
+    graspable: true
+
+  "pudding_box":
+    height: 0.0350
+    depth: 0.1100
+    width: 0.0890
+    grasp_lift: 0.000
+    graspable: false    # 窄边 0.089 > 开口
+
+  "sugar_box":
+    height: 0.1750
+    depth: 0.0380
+    width: 0.0890
+    grasp_lift: 0.052   # ★ 由 0.064 降到 0.052：0.064 = 夹在顶面下 23 mm、离重心 64 mm，
+                        #   而抗倾覆力臂只有半个厚度 19 mm → 夹持力一大就把盒子推倒 ✗（实测现象）
+                        #   0.052 是几何允许的最低高度（再低盒子顶部就撞手部肩部三角面）
+                        #   14 个角可行 ✓
+    graspable: true
+
+  "tomato_soup_can":
+    height: 0.1010
+    depth: 0.0660
+    width: 0.0660
+    grasp_lift: 0.014   # 圆柱 + 窄边 0.066，12 个角可行，最省事的备选 ✓
+    graspable: true
+
+  "tuna_fish_can":
+    height: 0.0330
+    depth: 0.0850
+    width: 0.0850
+    grasp_lift: 0.000
+    graspable: false    # 窄边 0.085 > 开口
+
+  "windex_bottle":
+    height: 0.2700
+    depth: 0.0800
+    width: 0.1050
+    grasp_lift: 0.043
+    graspable: false    # ★ 原来写的是 true：窄边 0.080 正好等于开口，零挤压余量、夹持力为 0 ✗
+                        # （几何自检：即使把高度调到最优，24 个角里 0 个可行 → 必须 false）

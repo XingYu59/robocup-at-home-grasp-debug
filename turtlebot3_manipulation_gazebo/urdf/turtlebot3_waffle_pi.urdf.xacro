@@ -155,6 +155,38 @@ https://github.com/ROBOTIS-GIT/turtlebot3/blob/kinetic-devel/turtlebot3_descript
     </inertial>
   </link>
 
+  <!-- ══════════ 前万向轮（本项目新增）══════════
+       为什么必须加：底盘 1.55 kg，机械臂 19.6 kg（质心还高 0.87 m），而支撑多边形
+       只有 [x=-0.177, x=0]——两个万向轮都在【后方】，驱动轮在 x=0。算下来机械臂
+       质心只要前移 0.2 mm 整车质心就越过轮轴 → 向前伸臂抓取时必然前倾（实测
+       pitch 达 0.22 rad ≈ 12.6°，导致末端偏离约 7 cm，完全抓不到物体）。
+       用位置 IK 求出能抓到桌面目标点的 57 个构型，机械臂质心 x ∈ [-0.068, +0.153]；
+       把支撑多边形前边界推到 +0.18 后允许到 +0.195，留 42 mm 余量（静态判据）。
+       这是修正模型几何，不是补偿：真实移动操作机器人前方也需要支撑点。
+       位置/几何/底面高度与既有后万向轮完全一致，保证落在同一接地平面上。 -->
+  <joint name="${prefix}caster_front_joint" type="fixed">
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}caster_front_link"/>
+    <origin xyz="0.18 0.0 -0.004" rpy="-1.57 0 0"/>
+  </joint>
+
+  <link name="${prefix}caster_front_link">
+    <collision>
+      <origin xyz="0 0.001 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.030 0.009 0.020"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <origin xyz="0 0 0" />
+      <mass value="0.005" />
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0"
+               iyy="0.001" iyz="0.0"
+               izz="0.001" />
+    </inertial>
+  </link>
+
   <joint name="${prefix}imu_joint" type="fixed">
     <parent link="${prefix}base_link"/>
     <child link="${prefix}imu_link"/>

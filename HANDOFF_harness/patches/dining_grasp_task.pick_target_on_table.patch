@@ -1,0 +1,411 @@
+--- Manipulation_ws/src/turtlebot3_manipulation_navigation2/scripts/dining_grasp_task.py	2026-09-13 11:58:01.030667879 +0800
++++ Robocup@home_ws/src/turtlebot3_manipulation_navigation2/scripts/dining_grasp_task.py	2026-09-13 16:19:47.443132695 +0800
+@@ -1,25 +1,29 @@
+ #!/usr/bin/env python3
+ """
+-任务节点 — 导航到固定站位 + 调抓取服务（固定物体，无视觉、无底盘微调）
++任务节点 — 抓到餐桌上已有的一个物体（导航 → 相对微调 → 调抓取服务）
+ 
+ 流程:
+-  1. 发布初始位姿到 /initialpose，等待 Nav2 就绪
+-  2. NavigateToPose 导航到**固定操作站位**（罐子在机械臂可及区内）
+-  3. 到位后底盘**完全停止**（不做任何微调 / 转向 / 前移）
++  1. 先选目标：读 gz 模型列表，挑出**餐桌上已经存在的**、类别在词表内且夹得住的物体，
++     按 TARGET_PREFERENCE 选一个（规则书 3.2/3.4：桌上并排四个物品，任选一个抓）
++  2. 由目标推出站位（物体正前方 0.33 m，且不贴桌沿），发布 /initialpose 等 Nav2 就绪，
++     NavigateToPose 导航过去
++  3. 到位后用**相对闭环微调**把物体开到 base_footprint(0.33, 0)（不查 map，不受定位误差影响）
+   4. 量出「物体在**底盘系**下的位置」——抓取只关心这个相对量：
+      仿真里用 gz 真值直接算（绕开 AMCL/里程计）；接入视觉后由视觉在**相机系**检测、
+      经「相机→底盘」的机器人内部 TF 变换（同样不经过 map）。
+-     再组织 GraspTargetStamped（class_id + "中心轴 ∩ 支撑面"的点）
++     再组织 GraspTargetStamped（class_id + "中心轴 ∩ 支撑面"的点），
++     **桌上其它物体一律作为 obstacles 一起发过去**（免得机械臂撞翻它们）
+   5. 调用抓取服务（grasp_node 提供），按返回的 success/stage 判断结果
+ 
+-用法（需先起仿真与导航；罐子已写在 example.world，无需 spawn）:
++用法（需先起仿真与导航；目标物体来自世界文件，不需要 spawn 任何东西）:
+   ros2 launch turtlebot3_manipulation_gazebo turtlebot3_franka.launch.py
+   ros2 launch turtlebot3_manipulation_navigation2 navigation.launch.py
+   ros2 launch turtlebot3_manipulation_grasp grasp_service.launch.py   # move_group+grasp_node
+   ros2 run turtlebot3_manipulation_navigation2 dining_grasp_task.py
+ 
+ 调试: --skip-nav（机器人已手动停在站位，只测服务链路）
+-      --park-x/--park-y/--park-yaw 调整固定站位（一次性设计，不动态改）
++      --target-name/--target-class 指定抓哪个（默认自动挑桌上最靠边的可抓物体）
++      --park-x/--park-y/--park-yaw 覆盖自动推出来的站位
+ """
+ 
+ import argparse
+@@ -49,33 +53,45 @@
+ # 初始位姿（与 turtlebot3_franka.launch.py spawn 参数、patrol_task 一致）
+ INITIAL_X, INITIAL_Y, INITIAL_YAW = -5.30, -0.50, 0.0
+ 
+-# 固定操作站位：dinning_table_3 北侧，罐子(3.0, 2.18)在车头前方 ~0.33m
+-# （臂基座在底盘 x=-0.092，0.33m 是稳定顶抓区）。到站后底盘不动。
+-PARK_X, PARK_Y, PARK_YAW = 3.0, 2.51, -math.pi / 2
+-
+-# 罐子（写在 example.world 里，固定位姿）：桌面顶 z=0.78，模型原点在底部，
+-# 中心 z = 0.78 + 0.06 = 0.84
+-CAN_NAME = "coke_can_dining"
+-CAN_CENTER_XYZ = (3.0, 2.18, 0.84)
+-CAN_DIMS = (0.12, 0.033)          # (height, radius)
++# ═══════════════════════════════════════════════════════════════
++# 抓取目标 = 餐桌上【已经存在的物体】，运行时枚举后从中选一个
++# ═══════════════════════════════════════════════════════════════
++# 规则书 3.2 / 3.4：餐厅里有一张餐桌，桌上并排放四个物品、位置由裁判定（不固定），
++# 机器人识别后【从四个里任选一个】抓起来、明显抬离桌面再放回。
++# 所以这里**不绑定任何"专用罐子"**，也不要求世界文件里有某个特定模型：
++#   启动时读 gz 的模型列表 + 各位姿 → 挑出落在桌面范围内、类别在词表里且可夹的物体，
++#   按 TARGET_PREFERENCE 的顺序选一个当目标，其余桌上物体作为【障碍物】一起发给抓取侧。
++MODEL_PREFIX_TO_CLASS = {          # gz 模型名前缀 → 类别名（与 objects.yaml / ITEM_NAMES 逐字一致）
++    "coke_can": "coke can",        # coke_can / coke_can_1 / coke_can_dining 都归到 "coke can"
++    "apple":    "apple",           # apple_clone_0 ...
++    "bowl":     "bowl",
++    "banana":   "banana",
++}
++# 越靠前越优先。按【夹爪能不能夹住】排：夹爪开口上限 0.08 m，碗直径 0.16 m 根本夹不住，
++# 所以碗放最后（只在前三类都没有时才考虑，实际会被 GRASPABLE_CLASSES 挡掉）。
++TARGET_PREFERENCE = ["coke can", "apple", "banana", "bowl"]
++# 可夹类别（与 grasp 包 config/objects.yaml 的 graspable 保持一致）
++GRASPABLE_CLASSES = {"coke can": True, "apple": True, "banana": True, "bowl": False}
++
++# 站位：停在物体正前方 STANDOFF_DIST 处（臂基座在底盘 x=-0.092，0.33 m 是实测
++# 可稳定顶抓的几何）；同时不能贴到桌沿，否则车体会顶住桌子。
++STANDOFF_DIST = 0.33               # m，车心到目标的距离（= 实测可规划的那个几何）
++EDGE_CLEARANCE = 0.26              # m，车心到桌沿的最小距离（车半径 + 余量）
++PARK_YAW = -math.pi / 2            # 面朝 -Y —— 从 +Y 侧接近餐桌
+ 
+ # Gazebo 里的机器人模型名（turtlebot3_franka.launch.py 的 spawn -name 参数）
+ ROBOT_MODEL_NAME = "turtlebot3"
+ 
+-# 类别名：必须与抓取侧 config/objects.yaml 的 key、以及视觉侧 ITEM_NAMES 完全一致。
+-# 工程约定【不改视觉侧的词表】，所以这里原样照抄（含空格）。
+-CAN_CLASS = "coke can"
+-BOWL_CLASS = "bowl"
+-
+-# 桌上的碗（example.world: bowl @ 2.6716 2.015 0.78）。固定站位场景里它是另一个
+-# 已知物体：本次不抓它，但要作为【障碍物】一起发给抓取侧，免得机械臂一头撞上去。
+-BOWL_CENTER_XYZ = (2.6716, 2.015, 0.78)
+-
+-# 真实餐桌 dinning_table_3（碗所在桌）: 桌面盒中心 z=0.765, yaw=π/2
++# 真实餐桌 dinning_table_3（= grasp_params.yaml 的 support_surface）：
++# 桌面盒中心 z=0.765, yaw=π/2, 局部尺寸 0.5(x) x 1.2(y) x 0.03(z)
+ TABLE_CENTER_XYZ = (2.7, 2.0, 0.765)
+ TABLE_YAW = math.pi / 2
+ TABLE_DIMS = (0.5, 1.2, 0.03)     # (x, y, z) 盒尺寸（模型局部系）
+ TABLE_TOP_Z = TABLE_CENTER_XYZ[2] + TABLE_DIMS[2] / 2.0   # = 0.78，桌面高度
++# 桌面在世界系下的半尺寸（yaw=π/2 时 x/y 互换）
++TABLE_HALF_X = TABLE_DIMS[1] / 2.0    # 0.60
++TABLE_HALF_Y = TABLE_DIMS[0] / 2.0    # 0.25
++TABLE_NEAR_EDGE_Y = TABLE_CENTER_XYZ[1] + TABLE_HALF_Y    # = 2.25，靠机器人这一侧的桌沿
+ 
+ # 臂基座（fr3_link0）在 base_footprint 下的 x 偏移（实测：base_footprint→base_link
+ # z+0.010，base_link→fr3_riser(-0.092,0,0.256)，riser→fr3_link0 z+0.165）。
+@@ -169,6 +185,10 @@
+         self.cmd_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
+         self._tf_buffer = tf2_ros.Buffer()
+         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
++        # 抓取目标：运行时从【餐桌上已有的物体】里挑，见 pick_target_on_table()
++        self.target_name = None
++        self.target_class = None
++        self.target_src_xyz = None
+         self.get_logger().info("dining_grasp_task 就绪")
+ 
+     # ── 初始定位 ──────────────────────────────────────────────
+@@ -281,6 +301,108 @@
+         xyz, rpy = nums[0], nums[1]
+         return (xyz[0], xyz[1], xyz[2], rpy[2])
+ 
++    def _gz_model_names(self):
++        """列出世界里的模型名（仿真专用）。用来找"餐桌上已经有的物体"。"""
++        exe = "ign" if shutil.which("ign") else ("gz" if shutil.which("gz") else None)
++        if exe is None:
++            return []
++        try:
++            out = subprocess.run([exe, "model", "--list"],
++                                 capture_output=True, text=True, timeout=5)
++        except Exception:
++            return []
++        if out.returncode != 0:
++            return []
++        # 输出形如：
++        #   Available models:
++        #       - ground_plane
++        #       - coke_can_1
++        names = []
++        for line in out.stdout.splitlines():
++            line = line.strip()
++            if line.startswith("- "):
++                names.append(line[2:].strip())
++        return names
++
++    @staticmethod
++    def _class_of_model(model_name):
++        """模型名 → 类别名；不属于词表返回 None（coke_can_1 / apple_clone_0 也认）。"""
++        for prefix, cls in MODEL_PREFIX_TO_CLASS.items():
++            if model_name == prefix or model_name.startswith(prefix + "_"):
++                return cls
++        return None
++
++    def pick_target_on_table(self, explicit_name=None, explicit_class=None):
++        """从【餐桌上已经存在的物体】里挑一个抓取目标。
++
++        规则书要求"从桌上四个物品里任选一个"，所以目标在运行时决定：
++          1. 列出世界里的模型 → 认得出类别的（coke can / apple / bowl / banana）
++          2. 位姿落在餐桌桌面范围内、且高度≈桌面 → 才算"桌上的物体"
++          3. 去掉夹不住的类别（GRASPABLE_CLASSES）→ 按 TARGET_PREFERENCE 的类序，
++             同类里挑离机器人这一侧桌沿最近的（站得越靠边越好抓）
++        返回 (name, cls, x, y) 或 None；同时把结果记到 self.target_*。
++        """
++        robot = self._gz_model_pose(ROBOT_MODEL_NAME)
++        cands = []
++        for name in self._gz_model_names():
++            cls = explicit_class if (explicit_name and name == explicit_name) else self._class_of_model(name)
++            if cls is None:
++                continue
++            if explicit_name and name != explicit_name:
++                continue
++            if explicit_class and cls != explicit_class:
++                continue
++            pose = self._gz_model_pose(name)
++            if pose is None:
++                continue
++            x, y, z = pose[0], pose[1], pose[2]
++            on_table = (abs(x - TABLE_CENTER_XYZ[0]) <= TABLE_HALF_X
++                        and abs(y - TABLE_CENTER_XYZ[1]) <= TABLE_HALF_Y)
++            if not on_table:
++                continue
++            if not GRASPABLE_CLASSES.get(cls, False):
++                self.get_logger().warn(
++                    "桌上物体 \"{}\"（{}）不可夹（见 objects.yaml graspable=false），跳过"
++                    .format(name, cls))
++                continue
++            if robot is not None and math.hypot(x - robot[0], y - robot[1]) < 0.15:
++                continue            # 太近的多半是机器人自己身上带的东西
++            cands.append({"name": name, "cls": cls, "x": x, "y": y, "z": z})
++
++        if not cands:
++            return None
++
++        def rank(c):
++            pref = TARGET_PREFERENCE.index(c["cls"]) if c["cls"] in TARGET_PREFERENCE else 99
++            return (pref, -(c["y"]))      # 同类里 y 越大越靠机器人这一侧
++
++        cands.sort(key=rank)
++        best = cands[0]
++        self.target_name = best["name"]
++        self.target_class = best["cls"]
++        self.target_src_xyz = (best["x"], best["y"], TABLE_TOP_Z)
++        self.get_logger().info(
++            "餐桌上可抓的物体 {} 个：{}；选 \"{}\"（{}）@ map({:.3f}, {:.3f})".format(
++                len(cands), [(c["name"], c["cls"]) for c in cands],
++                best["name"], best["cls"], best["x"], best["y"]))
++        return best["name"], best["cls"], best["x"], best["y"]
++
++    def table_objects(self):
++        """列出【餐桌上所有认得出类别的物体】（目标 + 障碍都要用）。"""
++        out = []
++        for name in self._gz_model_names():
++            cls = self._class_of_model(name)
++            if cls is None:
++                continue
++            pose = self._gz_model_pose(name)
++            if pose is None:
++                continue
++            x, y = pose[0], pose[1]
++            if (abs(x - TABLE_CENTER_XYZ[0]) <= TABLE_HALF_X
++                    and abs(y - TABLE_CENTER_XYZ[1]) <= TABLE_HALF_Y):
++                out.append({"name": name, "cls": cls, "x": x, "y": y})
++        return out
++
+     def _measure_targets(self):
+         """量出"物体相对底盘"的位置 —— 抓取只关心这个相对量。
+ 
+@@ -291,12 +413,12 @@
+         路径 B（退路）：用 map 常量，交给 grasp_node 自己 TF —— 这条链含定位误差，
+           只在读不到真值（无仿真/无 gz CLI）时使用。
+ 
+-        返回 (points, frame_id, 来源)；坐标一律是"轴心点 ∩ 支撑面"的语义。
++        返回 (points, frame_id, 来源)；points 是 {模型名: (x, y, z)}，坐标一律是
++        "轴心点 ∩ 支撑面"的语义。目标由 self.target_name 指认（见 pick_target_on_table）。
+         """
+-        can = self._gz_model_pose(CAN_NAME)
++        objs = self.table_objects()
+         robot = self._gz_model_pose(ROBOT_MODEL_NAME)
+-        bowl = self._gz_model_pose("bowl")
+-        if can is not None and robot is not None and bowl is not None:
++        if objs and robot is not None:
+             yaw = robot[3]
+             cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+ 
+@@ -304,21 +426,21 @@
+                 dx, dy = p[0] - robot[0], p[1] - robot[1]
+                 return (cos_y * dx + sin_y * dy,      # 世界向量 → base_footprint
+                         -sin_y * dx + cos_y * dy,
+-                        p[2] - robot[2])              # 物体原点(z) − 机器人原点(z) = 支撑面高度
++                        TABLE_TOP_Z - robot[2])       # 支撑面高度 − 机器人原点(z)
+ 
+             self.get_logger().info(
+-                "真值互查: 罐子模型原点(map {:.3f}, {:.3f}, {:.3f})，机器人(map {:.3f}, {:.3f}, "
+-                "z {:.3f}, yaw {:.3f})"
+-                .format(can[0], can[1], can[2], robot[0], robot[1], robot[2], yaw))
+-            return ({"can": rel(can), "bowl": rel(bowl)}, "base_footprint",
+-                    "gz 真值（相对，绕开定位）")
++                "真值互查: 桌上 {} 个物体，机器人(map {:.3f}, {:.3f}, z {:.3f}, yaw {:.3f})"
++                .format(len(objs), robot[0], robot[1], robot[2], yaw))
++            return ({o["name"]: rel((o["x"], o["y"], 0.0)) for o in objs},
++                    "base_footprint", "gz 真值（相对，绕开定位）")
+ 
+         self.get_logger().warn(
+-            "读不到 Gazebo 真值（罐子={} 机器人={} 碗={}），退回 map 常量 —— 这条链会带上定位误差"
+-            .format(can, robot, bowl))
+-        return ({"can": (CAN_CENTER_XYZ[0], CAN_CENTER_XYZ[1], TABLE_TOP_Z),
+-                 "bowl": (BOWL_CENTER_XYZ[0], BOWL_CENTER_XYZ[1], TABLE_TOP_Z)},
+-                "map", "map 常量（会带上定位误差）")
++            "读不到 Gazebo 真值（桌上物体={} 机器人={}），退回 map 常量 —— 这条链会带上定位误差"
++            .format(objs, robot))
++        fallback = {}
++        if self.target_src_xyz is not None:
++            fallback[self.target_name] = (self.target_src_xyz[0], self.target_src_xyz[1], TABLE_TOP_Z)
++        return fallback, "map", "map 常量（会带上定位误差）"
+ 
+     def _make_target_msg(self, class_id, point_xyz, frame_id, confidence=1.0):
+         """组织一条 GraspTargetStamped。
+@@ -340,12 +462,24 @@
+         return msg
+ 
+     def _build_target(self, points, frame_id, source):
+-        target = self._make_target_msg(CAN_CLASS, points["can"], frame_id)
+-        obstacles = [self._make_target_msg(BOWL_CLASS, points["bowl"], frame_id)]
++        """目标 = 选中的那个桌上物体；同桌上其它物体一律当【障碍物】发过去。"""
++        if self.target_name not in points:
++            self.get_logger().error(
++                "量不到目标 \"{}\" 的位置（points={}）".format(self.target_name, list(points)))
++            return None, None
++        target = self._make_target_msg(self.target_class, points[self.target_name], frame_id)
++        obstacles = []
++        for name, p in points.items():
++            if name == self.target_name:
++                continue
++            cls = self._class_of_model(name) or name
++            obstacles.append(self._make_target_msg(cls, p, frame_id))
+         self.get_logger().info(
+-            "目标: class=\"{}\" 轴心点 {}({:.3f}, {:.3f}, {:.3f}) 来源[{}]；障碍 {} 个 (\"{}\")".format(
+-                target.class_id, frame_id, target.point.x, target.point.y, target.point.z,
+-                source, len(obstacles), obstacles[0].class_id))
++            "目标: \"{}\" class=\"{}\" 轴心点 {}({:.3f}, {:.3f}, {:.3f}) 来源[{}]；"
++            "障碍 {} 个 {}".format(
++                self.target_name, target.class_id, frame_id,
++                target.point.x, target.point.y, target.point.z, source,
++                len(obstacles), [o.class_id for o in obstacles]))
+         return target, obstacles
+ 
+     def _log_parked_geometry(self, points, frame_id, source):
+@@ -378,18 +512,22 @@
+         except Exception as e:
+             self.get_logger().warn("读机器人 map 位姿失败: {}".format(e))
+ 
+-        mx, my, mz = points["can"]
++        if self.target_name not in points:
++            self.get_logger().warn("几何诊断：points 里没有目标 \"{}\"".format(self.target_name))
++            return
++        mx, my, mz = points[self.target_name]
+         self.get_logger().info(
+-            "目标(相对 {}) = ({:.3f}, {:.3f}, {:.3f})  来源[{}]；"
++            "目标 \"{}\"（{}）相对 {} = ({:.3f}, {:.3f}, {:.3f})  来源[{}]；"
+             "臂基座(fr3_link0, x={:.3f}) 到目标水平距离 = {:.3f} m"
+             "（FR3 臂展 0.855；实测 0.589 可规划、0.815 规划失败）".format(
+-                frame_id, mx, my, mz, source, ARM_BASE_X, math.hypot(mx - ARM_BASE_X, my)))
++                self.target_name, self.target_class, frame_id, mx, my, mz, source,
++                ARM_BASE_X, math.hypot(mx - ARM_BASE_X, my)))
+ 
+-        if frame_id == "base_footprint":
+-            rotated = quat_rotate(q_tf, CAN_CENTER_XYZ)
++        if frame_id == "base_footprint" and self.target_src_xyz is not None:
++            rotated = quat_rotate(q_tf, self.target_src_xyz)
+             cx, cy = rotated[0] + t_vec[0], rotated[1] + t_vec[1]
+             self.get_logger().info(
+-                "  对照: 走 TF(map 链路) 的罐心 = ({:.3f}, {:.3f})  ⇒ 定位差异 {:.3f} m"
++                "  对照: 走 TF(map 链路) 的目标 = ({:.3f}, {:.3f})  ⇒ 定位差异 {:.3f} m"
+                 "（两个数越接近，说明定位越准；抓取按前者算）".format(
+                     cx, cy, math.hypot(mx - cx, my - cy)))
+ 
+@@ -407,9 +545,9 @@
+         except Exception as e:            # 视觉/真值那一侧出问题不能把整个任务带崩
+             self.get_logger().warn("微调中读目标异常: {}".format(e))
+             return None
+-        if not points or "can" not in points:
++        if not points or self.target_name not in points:
+             return None
+-        x, y = points["can"][0], points["can"][1]
++        x, y = points[self.target_name][0], points[self.target_name][1]
+         if frame_id == "base_footprint":
+             return x, y
+         # 退路（map 常量）也能闭环，但要先转到底盘系
+@@ -529,6 +667,36 @@
+ 
+     def start(self):
+         self._wait_for_nav2()
++
++        # ★ 先选目标：规则书要求"从餐桌上四个物品里任选一个"，所以目标来自桌上
++        #   已经存在的物体（运行时枚举），站位也由它推出来（车心停在它正前方）。
++        picked = self.pick_target_on_table(self.args.target_name, self.args.target_class)
++        if picked is None:
++            self.get_logger().error(
++                "餐桌上没有可抓的物体（词表 {}，可夹的 {}）。"
++                "检查世界文件里 dinning_table_3 桌面上有没有目标类物体；"
++                "也可以 --target-name/--target-class 指定".format(
++                    list(MODEL_PREFIX_TO_CLASS), [k for k, v in GRASPABLE_CLASSES.items() if v]))
++            return False
++        name, cls, ox, oy = picked
++
++        # 站位：物体正前方 STANDOFF_DIST；同时不能比"桌沿 + 车半径"更贴近桌子 ✗
++        if self.args.park_x is None:
++            self.args.park_x = ox
++        if self.args.park_y is None:
++            self.args.park_y = max(oy + STANDOFF_DIST, TABLE_NEAR_EDGE_Y + EDGE_CLEARANCE)
++        if self.args.park_yaw is None:
++            self.args.park_yaw = PARK_YAW
++        standoff = self.args.park_y - oy
++        self.get_logger().info(
++            "目标 \"{}\"（{}）@ map({:.3f}, {:.3f}) → 站位 ({:.3f}, {:.3f}, yaw={:.3f})，"
++            "站位到目标 {:.3f} m".format(name, cls, ox, oy, self.args.park_x,
++                                          self.args.park_y, self.args.park_yaw, standoff))
++        if standoff > STANDOFF_DIST + 0.02:
++            self.get_logger().warn(
++                "目标离桌沿太远：站位被桌沿挡住，只能退到 {:.3f} m（理想 {:.3f} m）→ "
++                "微调可能会顶到桌子，优先挑靠桌沿那侧的物体 ✗".format(standoff, STANDOFF_DIST))
++
+         self._publish_initial_pose()
+         self._spin_for(5.0)   # 等 AMCL 收敛（必须 spin，否则 sim 时钟不走）
+ 
+@@ -554,6 +722,8 @@
+ 
+         # 组织本次抓取目标（视觉接入后，这一段换成调 /detect_grasp_target 取 targets）
+         target, obstacles = self._build_target(points, frame_id, source)
++        if target is None:
++            return False
+ 
+         # 调用抓取服务（抓取执行在 grasp_node 里，底盘不再动）
+         ok = self.call_grasp_service(target, obstacles)
+@@ -566,9 +736,16 @@
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="导航到固定站位并调抓取服务")
+-    parser.add_argument("--park-x", type=float, default=PARK_X)
+-    parser.add_argument("--park-y", type=float, default=PARK_Y)
+-    parser.add_argument("--park-yaw", type=float, default=PARK_YAW)
++    parser.add_argument("--park-x", type=float, default=None,
++                        help="固定站位 x；默认由【选中的桌上物体】推出来（物体正前方 0.33m）")
++    parser.add_argument("--park-y", type=float, default=None,
++                        help="固定站位 y；默认由选中的物体 + 桌沿余量推出来")
++    parser.add_argument("--park-yaw", type=float, default=None,
++                        help="固定站位 yaw；默认 -π/2（从 +Y 侧接近餐桌）")
++    parser.add_argument("--target-name", default=None,
++                        help="指定要抓的 gz 模型名（默认自动从餐桌上挑一个）")
++    parser.add_argument("--target-class", default=None,
++                        help="指定要抓的类别（coke can / apple / bowl / banana；默认自动挑）")
+     parser.add_argument("--skip-nav", action="store_true",
+                         help="跳过导航（调试：机器人已手动停在站位）")
+     parser.add_argument("--no-creep", action="store_true",

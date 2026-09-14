@@ -1384,13 +1384,9 @@
       <name>potted_meat_can</name>
       <pose>1.9 1.5 0.78 0 0 0</pose>
     </include>
-    <!-- ★ 2026-09-14 用户批准的换物体实验：餐桌 3 上的 pudding_box 换成番茄汤罐（圆柱） -->
-    <!--   目的：把"物体本身的问题"与"抓取算法的问题"分开 —— 圆柱是最友好的抓取目标 -->
-    <!--   （轴心点最稳、24 个采样角里 12 个可行）。想还原就把下面这段换回 pudding_box -->
-    <!--   （原始内容在 example.world.bak_before_can ✓） -->
     <include>
-      <uri>model://tomato_soup_can</uri>
-      <name>tomato_soup_can_t3</name>
+      <uri>model://pudding_box</uri>
+      <name>pudding_box</name>
       <pose>2.3 2.0 0.78 0 0 0</pose>
     </include>
     <include>

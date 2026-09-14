@@ -1,0 +1,39 @@
+# DetectGraspTarget.srv
+#
+# 按需检测服务 —— 由【视觉侧节点】提供，由【编排节点】调用。
+# 视觉侧实现时复用工程内现成的东西即可：
+#   vision_pipeline.VisionPipeline().detect() / classify_phrase()
+#   patrol_task.py 里的 _imgmsg_to_depth() / _depth_at_mask() /
+#   _resolve_camera_frame() / tf_buffer.lookup_transform()
+#
+# ── 输出帧（重要）──────────────────────────────────────────────────
+#   返回的 target.header.frame_id 请给【相对底盘】的帧，推荐：
+#     "camera_rgb_optical_frame"（首选：在相机系给点，别再做 map 变换）
+#     或 "base_footprint"
+#   **不要给 "map"** —— map 那一段 TF 含 AMCL 定位误差，会把误差带进抓取。
+#   做法上就是：现在 patrol_task.py 里"掩码质心 → 深度反投影 → 相机系 3D 点"
+#   这一步照旧，把最后那次 lookup_transform("map", cam_frame) 省掉（或两个都给），
+#   因为「相机→base_footprint」是机器人内部的固定变换，抓取侧自己就能用 TF 查到。
+#
+# ── 调用时机（重要）────────────────────────────────────────────────
+#   机器人导航到固定站位、底盘【停稳】之后，抓取之前，调用一次。
+#   用服务而不是话题，就是为了"按需取一次最新状态"：
+#   patrol_task.py 里那些累计/去重的坐标是巡逻期间的旧值，底盘动过就不能用。
+#
+# ── 返回的 target 语义 ──────────────────────────────────────────────
+#   见 msg/GraspTargetStamped.msg。一句话：point = 物体中心轴 ∩ 支撑面的交点
+#   （z = 支撑面高度），不是"相机看到的那一点"。
+#   因此视觉侧需要知道支撑面高度（固定站位常数，作为该节点的参数传入即可）。
+
+string[] class_ids        # 想找哪几类；空数组 = 不限类别，返回置信度最高的一个。
+                          # 取值必须是 vision_pipeline.ITEM_NAMES 的原样字符串：
+                          #   "apple" / "coke can" / "bowl"
+                          # （不做改名/归一化 —— 本工程约定不改视觉侧的词表）
+---
+bool success              # false 时 targets 为空
+string message            # 失败原因："no detection" / "depth invalid" / "no class matched" ...
+GraspTargetStamped[] targets   # 本次检测到的目标，**按置信度从高到低排序**
+                               # 为什么是数组：规则书 3.2/3.4 是"桌上四个物品任选一个抓"，
+                               # 而四个里可能夹着夹不住的（如 bowl 直径 0.16 > 夹爪开口 0.08）。
+                               # 调用方按顺序挑：targets[0] 抓失败（BAD_TARGET/NO_SOLUTION）
+                               # 就换 targets[1] 重试；挑剩下的几个还能当障碍物传给抓取侧。

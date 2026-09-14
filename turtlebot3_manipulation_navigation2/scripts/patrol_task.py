@@ -25,6 +25,7 @@ import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.time import Time
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
@@ -34,6 +35,18 @@ import tf2_ros
 
 # 视觉识别流水线（GroundingDINO + SAM2），单独文件便于复用 / 离线测试
 import vision_pipeline
+
+# 抓取阶段（Phase 2 = 拔高题）。实现全在 grasp_phase.py，
+# 独立调试入口 dining_grasp_task.py 调的是同一份，避免两份逻辑漂移 ✓
+import grasp_phase
+
+# ── use_sim_time（★ 我方新增，必须）─────────────────────────────
+# 本节点现在要调 /grasp_fixed_object，而 grasp_node / move_group 都跟随 Gazebo 的
+# /clock（仿真钟）。若本节点用墙钟，目标时间戳会比抓取侧 now() 大十几亿秒，
+# 被新鲜度校验直接拒收 ✗（实测：
+#   "目标时间戳比本节点时钟超前 1789312459.68s —— 时钟域不一致"）
+# 旧驱动 dining_grasp_task.py 一直这么设；patrol_task 原来不调抓取服务所以没设。
+USE_SIM_TIME = True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -121,7 +134,10 @@ def yaw_to_quat(yaw):
 
 class CompetitionTask(Node):
     def __init__(self):
-        super().__init__("patrol_task")
+        super().__init__(
+            "patrol_task",
+            parameter_overrides=[Parameter("use_sim_time", value=bool(USE_SIM_TIME))],
+        )
 
         # 初始位姿发布
         self.init_pub = self.create_publisher(
@@ -169,9 +185,22 @@ class CompetitionTask(Node):
         self._seen_objects = []            # 已登记物品（/map 位置 + 深度，用于去重）
         self._item_counts = {name: 0 for name in vision_pipeline.ITEM_NAMES}
 
-        # 视觉流水线延迟到首次识别时才加载（模型加载耗时 + 占显存）
+        # 视觉流水线：首次用到时加载（模型加载耗时 + 占显存），但会先后台预热
         self._pipeline = None
         self._pipeline_error = None
+        self._pipeline_lock = threading.Lock()
+
+        # ── Phase 2（拔高题）：抓取 ────────────────────────────
+        # 规则书 3.1：基础题做完不回起点，直接从客厅去餐厅 → 同一个进程里接着跑。
+        # 这两个值由 main() 按命令行参数覆盖。
+        self.run_grasp = True
+        self.grasp_classes = []                     # 空 = 按优先级自己挑
+        # 观察位：None = 让抓取侧按【餐桌桌沿法线】自己算（推荐，见 grasp_phase.py）
+        #   原来写死 (2.7, 3.2, -π/2)：那是"这一张桌子 + 这一个起始位置"的答案，
+        #   而且站位曾经用"机器人当前方位"当接近方向 → 机械臂斜 24° 伸到桌上 ✗
+        #   （2026-09-14 用户指出"观察点有问题、机械臂没对正桌子"）。
+        #   现在观察位与站位共用同一条法线，机械臂全程正对桌子。
+        self.grasp_observation = None
 
         self.get_logger().info("CompetitionTask 节点已就绪。")
 
@@ -181,6 +210,10 @@ class CompetitionTask(Node):
         self.get_logger().info("=" * 45)
         self.get_logger().info("任务启动: 初始定位 → {} 个观察点巡逻".format(len(WAYPOINTS)))
         self.get_logger().info("=" * 45)
+        # ★ 后台预热视觉流水线：与"发初始位姿 + 导航到第一个观察点"并行，
+        #   省掉到点后才能开始的 ~77 s 模型加载（含 INSID3 复核，实测）
+        threading.Thread(target=self._ensure_pipeline, daemon=True).start()
+
         # 先等 Nav2 就绪，再发初始位姿（否则 AMCL 还没启动，收不到 /initialpose）
         self._wait_for_nav2()
         self._publish_initial_pose()
@@ -211,7 +244,9 @@ class CompetitionTask(Node):
         self.get_logger().info("等待 Nav2 action server...")
         timeout = time.time() + 60.0
         while rclpy.ok() and time.time() < timeout:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            # ★ 不要用 rclpy.spin_once(self)：它会把本节点挂到【全局 executor】上，
+            #   之后 main() 再把它加进 MultiThreadedExecutor 会冲突 ✗
+            #   （Phase 2 抓取阶段需要多线程）。这里只查服务器就绪，不必 spin。
             if self.nav_client.server_is_ready():
                 print("Nav2 已就绪。", flush=True)
                 self.get_logger().info("Nav2 已就绪。")
@@ -298,11 +333,25 @@ class CompetitionTask(Node):
     # ── 视觉识别 ───────────────────────────────────────────────
 
     def _ensure_pipeline(self):
-        """首次调用时加载 GroundingDINO + SAM2 模型（耗时，只做一次）。
+        """首次调用时加载 GroundingDINO + SAM2（+ INSID3 复核）模型。
 
         返回 True 表示可用；加载失败时记录错误并返回 False，保证巡逻继续，
         不会因为视觉模型问题把整个任务卡死在第一个观察点。
+
+        ★ 我方改动：加了锁 + 支持后台预热。装上 INSID3 闭集复核权重后
+        （scripts/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth，327 MB），
+        构造一次实测要 ~77 s（没有复核时 ~4 s）✗。原来的懒加载等于
+        "到第一个观察点才开始干等 77 s"，白吃 8 分钟预算的一分多钟；
+        现在 start() 里起后台线程预热，加载与导航并行 ✓
         """
+        if self._pipeline is not None:
+            return True
+        with self._pipeline_lock:
+            if self._pipeline is not None:
+                return True
+            return self._load_pipeline_locked()
+
+    def _load_pipeline_locked(self):
         if self._pipeline is not None:
             return True
         self.get_logger().info(
@@ -685,11 +734,60 @@ class CompetitionTask(Node):
         # 生成评分程序要求的答案 JSON
         self._save_answer_json()
 
+        # ── Phase 2：拔高题（抓取）────────────────────────────────
+        # 放在写答案之后：基础题的结果先落袋，拔高题失败也不影响提交 ✓
+        if self.run_grasp:
+            self._run_grasp_phase()
+
+    # ── Phase 2：抓取（拔高题）─────────────────────────────────
+
+    def _run_grasp_phase(self):
+        """导航到餐厅餐桌 → 选一个可夹的目标 → 相对微调 → 抓取。
+
+        实现全部在 grasp_phase.py（与 dining_grasp_task.py 共用一份 ✓）。
+        这里只负责：起阶段、传参数、把结果写进日志；任何异常都不许影响基础题 ✗
+        """
+        self.get_logger().info("=" * 45)
+        self.get_logger().info("Phase 2：拔高题（抓取）开始 —— 基础题结果已提交")
+        self.get_logger().info("=" * 45)
+        try:
+            phase = grasp_phase.GraspPhase(
+                self,
+                target_classes=self.grasp_classes,
+                nav_client=self.nav_client,
+            )
+            ok = phase.run(observation_pose=self.grasp_observation)
+            self.get_logger().info("Phase 2 结束：{}".format("抓取成功 ✓" if ok else "未完成 ✗"))
+        except Exception as e:                    # noqa: BLE001
+            import traceback
+            self.get_logger().error(
+                "Phase 2 异常（基础题结果不受影响）: {}\n{}".format(e, traceback.format_exc()))
+
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="比赛主流程：Phase 1 巡逻计数 + Phase 2 抓取")
+    parser.add_argument("--no-grasp", action="store_true", help="只做基础题，不跑抓取阶段")
+    parser.add_argument("--no-sim-time", action="store_true",
+                        help="用墙钟（默认跟随 Gazebo /clock；不跟随会让抓取服务拒收目标）")
+    parser.add_argument("--grasp-classes", default="",
+                        help="只抓这几类（逗号分隔，如 \"coke can,apple\"）；默认按优先级自己挑")
+    parser.add_argument("--grasp-observation", default="",
+                        help="手工指定观察位 \"x,y,yaw\"；默认由抓取侧按餐桌桌沿法线自己算")
+    args, _ = parser.parse_known_args()
+    if args.no_sim_time:
+        globals()["USE_SIM_TIME"] = False      # 必须在建节点之前改
+
     print("=== patrol_task starting ===", flush=True)
     rclpy.init()
     node = CompetitionTask()
+    node.run_grasp = not args.no_grasp
+    node.grasp_classes = [c.strip() for c in args.grasp_classes.split(",") if c.strip()]
+    if args.grasp_observation:
+        v = [float(x) for x in args.grasp_observation.split(",")]
+        if len(v) == 3:
+            node.grasp_observation = tuple(v)
     print("=== node created, waiting for AMCL... ===", flush=True)
 
     # 等待 AMCL 初始定位收敛
@@ -698,12 +796,18 @@ def main():
     # 设置初始位姿 + 等待 Nav2 + 开始巡逻
     node.start()
 
-    # start() 内部的导航结果通过 action callback 异步处理
+    # start() 内部的导航结果通过 action callback 异步处理。
+    # ★ 必须多线程 executor：Phase 2 的抓取阶段在"轮询等服务/等 future"，
+    #   单线程下会把回调堵死 ✗（视觉适配层那边已经踩过一次同样的坑）
+    from rclpy.executors import MultiThreadedExecutor
+    ex = MultiThreadedExecutor(num_threads=3)
+    ex.add_node(node)
     try:
-        rclpy.spin(node)
+        ex.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        ex.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

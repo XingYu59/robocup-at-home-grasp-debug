@@ -1,0 +1,12 @@
+# Kinematics solver for each planning group.
+# LMA (Limited Memory BFGS) ships with moveit_kinematics and handles the 7-DOF
+# FR3 well. If you install trac-ik, swap to:
+#   kinematics_solver: trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin
+
+arm:
+  kinematics_solver: lma_kinematics_plugin/LMAKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.05
+  kinematics_solver_attempts: 3
+
+# hand is a single prismatic joint driven by GripperCommand; no IK solver needed.

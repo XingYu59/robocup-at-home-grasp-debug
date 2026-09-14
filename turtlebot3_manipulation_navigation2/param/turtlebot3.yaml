@@ -131,7 +131,10 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      # 放宽到 0.4：最后十来厘米的精度改由 dining_grasp_task 的【相对闭环微调】负责
+      # （它闭环"物体在 base_footprint 的位置"，不受 AMCL 误差影响）。
+      # 容差太紧时 DWB 会为了消除定位误差反复磨蹭、甚至超时 abort。
+      xy_goal_tolerance: 0.4
       yaw_goal_tolerance: 0.25
     # DWB parameters
     FollowPath:
@@ -188,12 +191,12 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.22
+      robot_radius: 0.28   # 车体实际 0.281x0.306（外接≈0.21）+ arm 前向余量
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        cost_scaling_factor: 4.0   # 衰减更快 → 路径不再绕开一大圈
+        inflation_radius: 0.45     # 致命区由 robot_radius 决定，这里只是软避让范围
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -227,7 +230,7 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
-      robot_radius: 0.22
+      robot_radius: 0.28   # 车体实际 0.281x0.306（外接≈0.21）+ arm 前向余量
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -250,8 +253,8 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        cost_scaling_factor: 4.0   # 衰减更快 → 路径不再绕开一大圈
+        inflation_radius: 0.45     # 致命区由 robot_radius 决定，这里只是软避让范围
       always_send_full_costmap: True
 
 map_server:

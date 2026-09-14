@@ -1,0 +1,125 @@
+# grasp_params.yaml
+#
+# grasp_node 的全部外部配置。一次装下两层参数，各读各的：
+#   * 适配层（grasp_node 自己读）：目标校验、目录表位置、支撑面…
+#   * 规划层（pick_and_place 的实现读）：规划组/帧/命名状态/抓取与放置调参…
+#
+# 数值依据（都来自本工程实测/本工程文件，不是估的）：
+#   * 规划帧 = base_footprint（URDF 根，SRDF 无 virtual joint，已实测）
+#   * 支撑面 = 餐厅 dinning_table_3（example.world: pose 2.7 2 0 0 0 1.57，
+#     桌面盒 0.5 x 1.2 x 0.03 @ 局部 z=0.765 → 桌面顶 z = 0.78）
+#   * 夹爪开口 2 x 0.04 = 0.08（fr3_finger_joint1 limit upper = 0.04，mimic 对称）
+
+/**:
+  ros__parameters:
+    # ═══════════════ 适配层（grasp_node）═══════════════
+    planning_frame: "base_footprint"
+    object_id: "object"                  # 加进规划场景的碰撞体 id
+    objects_catalog: "objects.yaml"      # 相对 <包 share>/config/ 解析
+    max_target_age: 10.0                 # s；视觉目标的 stamp 超过它就拒收
+    arm_base_frame: "fr3_link0"          # 可达范围校验的基准（TF 查）
+    reach_min: 0.10                      # m
+    # 硬上限按实测定：物体距 fr3_link0 0.815 m 时 MTC 在 approach 阶段无解（0.03 < 0.10），
+    # 0.589 m 时能找到 10 个解。所以 0.85（名义臂展）太乐观，收紧到 0.75 快速拒收，
+    # 免得白等一次 6 s 的规划失败。
+    reach_max: 0.75                      # m
+    reach_comfort_min: 0.35              # m；舒适带（只告警不拒绝）
+    reach_comfort_max: 0.65              # m；上界按实测定：理想站位（物体 base(0.33~0.35, 0)）
+                                         # 对应 0.589~0.600 m，留出余量免得正常流程天天误报
+    # 经过定位链（含 AMCL 误差）的帧：目标是这些帧时打警告并提示改发相对帧。
+    # 抓取只需要"物体相对底盘"，应该走相机系/base 系。
+    frames_with_localisation_error: ["map"]
+
+    # 支撑面（用于 1) 建场景碰撞体 2) 校验目标是否落在桌面上）
+    # 位姿写在 map 帧：桌子在世界里固定，机器人停位有误差，
+    # 所以由适配器用 TF 把它和目标一起换算到规划帧 —— 误差自动抵消。
+    support_surface.enabled: true
+    support_surface.frame: "map"
+    # ★ 换物体实验用：想抓别的桌子上的物体，只改这一行（orchestration 侧会跟着读同一个文件 ✓）
+    #   living_room_table_1（上面有 tomato_soup_can）：[-3.3, -2.1, 0.765, 0.0, 0.0, 1.5707963267948966]
+    support_surface.pose: [2.7, 2.0, 0.765, 0.0, 0.0, 1.5707963267948966]  # [x,y,z,r,p,y] 餐厅 dinning_table_3
+    support_surface.length: 0.5          # x
+    support_surface.width: 1.2           # y
+    support_surface.thickness: 0.03      # z
+
+    z_tolerance: 0.03                    # m；目标点 z 应约等于桌面顶高度
+    footprint_margin: 0.05               # m；允许目标略微超出桌面足迹
+
+    # ═══════════════ 规划层（pick_and_place）═══════════════
+    arm_group_name: "arm"
+    eef_name: "hand"                     # SRDF <end_effector name="hand">
+    hand_group_name: "hand"
+    hand_frame: "fr3_hand_tcp"           # 抓取/IK 帧
+    hand_open_pose: "open"               # SRDF group_state
+    hand_close_pose: "close"             # 仅当物体宽度未知时的退路；正常走 close_hand_squeeze
+    arm_home_pose: "home"
+    world_frame: "base_footprint"        # 升降/下压方向参考帧（本工程无 world 帧）
+
+    # 合爪目标 = 物体窄边 min(width, depth) / 2 − 本值（m），再按手指关节限位裁剪。
+    # 不用命名状态 "close"(=0.0 全闭)：真机上手指被物体挡住，命令 0.0 时位置误差
+    # ≈ 物体半宽（罐子 0.0335 m），远超 GripperActionController 默认 goal_tolerance
+    # 0.01 → 动作 abort，表现为"规划全对、一到合爪就失败"。
+    # 本值同时就是到位时的残余误差（物体挡着时），必须 < goal_tolerance(0.01)：
+    #   当前 0.0045 → 两指最终停在「窄边 − 9 mm」= 糖盒(38 mm) 停在 **29 mm** ✓
+    #   现场试验记录（一个数就能改，改完重启 grasp_service 即可，不用编译）：
+    #     0.0007 (=窄边−1.4mm) / 0.0030 (=−6mm)：现场报"闭合不够、贴着盒子上去" ✗
+    #     0.0070 (=−14mm)：现场报"盒子被挤走 / 手指在空档里合拢" ✗
+    #     0.0045 (=−9mm)：本次要试的中间值 —— 又能咬住、又不容易把盒子挤跑
+    close_hand_squeeze: 0.0045
+    # 合爪速度缩放（1.0 = 关节速度上限）。实测 0.4s 走完全程属冲击式，会把轻物体挤飞；
+    # 放慢到 0.15（约 1.3s）消除冲击。只影响 close hand，open hand 行为不变。
+    close_hand_speed_scaling: 0.15
+
+    # 放置点：默认【放回原处】（x,y 取目标箱心，z 取它的支撑面高度）。
+    # 规则书要求"清楚地抬起再放回去"，不是搬到桌面上别的地点；放回原处也更省时间。
+    place_back_at_target: true
+    # 仅当 place_back_at_target: false 时才用下面这个固定点（调试用）
+    place_pose: [0.45, 0.15, 0.78, 0.0, 0.0, 0.0]   # 规划帧下，z = 支撑面高度
+    place_surface_offset: 0.0001
+
+    # ── 抓取方式：顶抓（当前采用，实测可规划）───────────────────────
+    # ik_frame(fr3_hand_tcp) → 虚拟抓取帧，格式 [x, y, z, r, p, y]。
+    # rpy = (π, 0, 0) 的含义（物体坐标系下，Rz(采样角) 之前）：
+    #     手的前进轴(+z) → 竖直向下    ⇒ 从上方下探
+    #     手指闭合轴(±y) → 水平        ⇒ 两指在物体两侧水平合拢
+    # 位置：
+    #     z = 0.03  沿指尖方向的抬升：指尖平面停在箱心上方 3cm，
+    #               于是手指夹住物体的【上段】（罐高 0.124 时约夹上半部）。
+    #               每类物体可用 objects.yaml:grasp_lift 单独覆盖
+    #               （扁物体给小值、细高物体给大值）。
+    #     x,y = 0
+    #
+    # ── 备选：水平侧抓（已验证位姿本身可达，但当前 MTC 调用链解不出来）──
+    # 侧抓对细高物体更稳（夹持点靠近重心），配置是：
+    #     [0.0, 0.0, 0.005, 0.0, -1.5707963267948966, 0.0]
+    # 手前进轴水平、两指等高、指腹长边竖直。当时卡在 MTC 的 ComputeIK：
+    # 同一个位姿用 move_group 的 /compute_ik 服务能解出来（error_code=1），
+    # 但 MTC 里 25/25 个采样角全 "no IK found"（种子/IK 预算/碰撞/旋转都排除过了），
+    # 怀疑与它把 tip 传成 fr3_link7、以及 LMA 求解器有关。修好工具链后再启用。
+    grasp_frame_transform: [0.0, 0.0, 0.03, 3.141592653589793, 0.0, 0.0]
+
+    # 抓取角采样步长（绕物体自身 z 轴）。**90° 一步，不是 15°** —— 这是现场修出来的：
+    #
+    # ★ 为什么必须 90°（2026-09-14 用户观察："夹爪转了、但还是不正对着盒子"）：
+    #   GenerateGraspPose 只是"绕物体 z 轴按 angle_delta 扫一圈"，它**不知道该往哪夹**；
+    #   能不能用完全由 ComputeIK 的碰撞检查决定：张开的两指（内壁 ±40 mm）不碰物体就行 ✗
+    #   对 0.038 × 0.089 的薄盒，闭合方向与薄边偏 ±30° 以内时投影只有 77 mm < 80 mm 开口
+    #   → 24 个采样角里有 **14 个都"可行"** ✗
+    #   → MTC 按代价挑解、根本不看"正不正对" → 挑到偏 15°/30° 的角，
+    #     手指就是斜着下去、斜着合拢（现场看到的现象）✗
+    #   改成 90° 一步后，采样只有 {0°, 90°, 180°, 270°} = 物体自身的两个主轴方向：
+    #     薄盒(0.038×0.089)：0/180 一定夹不进（0.089 > 开口）→ 只剩 90/270 = 正对薄边 ✓
+    #     芥末瓶(0.058×0.095) / 漂白瓶(0.098×0.065) / 饼干盒(0.060×0.158) / 午餐肉(0.050×0.097)
+    #       同样被迫用"薄边那一对方向" ✓（以前它们也可能被挑成横着夹 ✗）
+    #     方罐 / 球（0.066~0.075 各向接近）：四个方向都可行、也都正对盒面 ✓
+    #   附带好处：IK 候选从 24 个降到 4 个 → 规划更快 ✓
+    angle_delta: 1.5707963267948966      # π/2（只试物体自身的两个主轴方向）
+    approach_object_min_dist: 0.10
+    approach_object_max_dist: 0.15
+    lift_object_min_dist: 0.08           # 规则书要求"明显抬离桌面"→ 至少抬 8 cm（更直观可见）
+    lift_object_max_dist: 0.12
+    lower_object_min_dist: 0.03
+    lower_object_max_dist: 0.13
+    retreat_min_dist: 0.12
+    retreat_max_dist: 0.25
+    max_solutions: 10
