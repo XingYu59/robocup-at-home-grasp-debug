@@ -86,7 +86,7 @@ STAGE_TEXT = {
     7: "BUSY 已有抓取在执行",
 }
 
-# ── 目标优先级（见 docs/HANDOFF_grasp_orchestration_design.md §2）─────────
+# ── 目标优先级（见 docs/handoff/HANDOFF_grasp_orchestration_design.md §2）─────────
 # 越靠前越稳：圆柱类位置换算误差≈0；方盒有 8~20 mm 的【径向】偏差 + 掀翻风险；
 # 香蕉长边 0.198 必须跨窄边、薄件指尖容易骑到顶面 → 放最后。
 TARGET_TIERS = [
@@ -138,7 +138,7 @@ GOAL_ACCEPT_TIMEOUT = 15.0
 TF_RETRY = 30
 MIN_CONFIDENCE = 0.35           # 低于它不当作候选（开集检测在 1 m 外只有 0.35~0.46，
                                 # 定 0.50 会把真目标全部拒掉 ✗；误检靠尺寸核对 +
-                                # 支撑面校验 + 多帧投票压住，见 docs/HANDOFF_vision_grasp_interface.md）
+                                # 支撑面校验 + 多帧投票压住，见 docs/handoff/HANDOFF_vision_grasp_interface.md）
 REACH_MIN, REACH_MAX = 0.10, 0.75
 MAX_TARGET_TRIES = 2            # 抓失败换目标的次数（规则书：四个里任选一个）
 

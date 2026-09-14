@@ -1,3 +1,5 @@
+> **交接/接手调试先看仓库根的 [HANDOFF.md](../HANDOFF.md)** ✓（本目录是调试工具，用法见下）
+
 # HANDOFF 工具目录（**不属于任何 ROS 包**，colcon 不会安装它）
 
 本目录只放**离线自检工具**。这里没有 package.xml，所以放在 `src/` 下不会被 colcon 当成包 ✓。

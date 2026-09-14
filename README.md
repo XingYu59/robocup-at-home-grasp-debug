@@ -1,3 +1,9 @@
+> ## 🔧 抓取调试交接（2026-09-14）
+> **接手调试请先看 [HANDOFF.md](HANDOFF.md)** —— 现状、未解问题与方向、工具、复现命令、踩过的坑都在那里；
+> 详细交接文档集中在 [`docs/handoff/`](docs/handoff/)。
+> 一句话现状：整条链已跑通到 `stage=0` ✓，但**物理夹持仍未成功** ✗
+> （现象：夹爪看着包住物体、能闭合，物体纹丝不动；日志 `两指真实间距` 合到指令值 = 两指之间是空的 ✗）。
+
 # TurtleBot3 + FR3 导航仿真
 
 TurtleBot3 Waffle Pi + FR3 机械臂在 **Gazebo Fortress (Ignition Gazebo)** 中的仿真包，

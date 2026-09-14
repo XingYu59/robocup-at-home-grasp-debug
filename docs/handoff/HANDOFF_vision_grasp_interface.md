@@ -153,7 +153,7 @@ ros2 run turtlebot3_manipulation_navigation2 patrol_task.py
 ros2 run turtlebot3_manipulation_navigation2 dining_grasp_task.py [--truth-only] [--classes "coke can"]
 ```
 
-**Phase 2 内部顺序**（细节见 `docs/HANDOFF_grasp_orchestration_design.md`）：
+**Phase 2 内部顺序**（细节见 `docs/handoff/HANDOFF_grasp_orchestration_design.md`）：
 观察位看整桌 → 选一个"可夹 + 可达"的目标（按优先级档位）→ 算站位 → 导航 → **站位上重测** →
 creep 相对闭环（方位容差已收紧到 0.013 rad ≈ ±4.3 mm，且要连续 3 轮达标）→
 `/grasp_fixed_object`（target + 其余物品当 obstacles）→ `BAD_TARGET/NO_SOLUTION` 就换下一个目标。
