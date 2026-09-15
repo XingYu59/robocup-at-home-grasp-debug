@@ -930,22 +930,6 @@ class DetectGraspTargetNode(Node):
                 self.get_logger().error(response.message)
                 return response
 
-            # ★ 桌平面校验（一次调用一条）：深度+内参+外参+支撑面高度 四者同时验证
-            if self.table_check:
-                chk = self._table_plane_check(depth, k, tf)
-                if chk is None:
-                    self.get_logger().warn(
-                        "  桌平面校验：找不到足够的桌面像素（相机没对着桌面？）")
-                else:
-                    bad = abs(chk["mean"] - self.support_z) > 0.010 or abs(chk["slope"]) > 0.002
-                    self.get_logger().info(
-                        "  桌平面校验: {} 个桌面像素 → 反投影 z={:.4f}±{:.4f} m "
-                        "（配置 {:.3f}，差 {:+.0f} mm；随像素行斜率 {:.2f} mm/px）{}".format(
-                            chk["n"], chk["mean"], chk["std"], self.support_z,
-                            (chk["mean"] - self.support_z) * 1000.0, chk["slope"] * 1000.0,
-                            "   ✗ 深度/外参/桌面高度有不一致，位置必然偏"
-                            if bad else "   ✓ 四者一致"))
-
             # ══════════ 检测：多帧投票（+ 抓取模式的窄词表复核）══════════
             # 帧级检测函数：返回 {class: (conf, det)}（同一类取该帧里分最高的框）
             def _frame(prompt, use_rev):
@@ -1070,6 +1054,22 @@ class DetectGraspTargetNode(Node):
 
             want = [c for c in (request.class_ids or []) if c]
             k = info_msg.k
+            # ★ 桌平面校验（一次调用一条）：深度+内参+外参+支撑面高度 四者同时验证
+            if self.table_check:
+                chk = self._table_plane_check(depth, k, tf)
+                if chk is None:
+                    self.get_logger().warn(
+                        "  桌平面校验：找不到足够的桌面像素（相机没对着桌面？）")
+                else:
+                    bad = abs(chk["mean"] - self.support_z) > 0.010 or abs(chk["slope"]) > 0.002
+                    self.get_logger().info(
+                        "  桌平面校验: {} 个桌面像素 → 反投影 z={:.4f}±{:.4f} m "
+                        "（配置 {:.3f}，差 {:+.0f} mm；随像素行斜率 {:.2f} mm/px）{}".format(
+                            chk["n"], chk["mean"], chk["std"], self.support_z,
+                            (chk["mean"] - self.support_z) * 1000.0, chk["slope"] * 1000.0,
+                            "   ✗ 深度/外参/桌面高度有不一致，位置必然偏"
+                            if bad else "   ✓ 四者一致"))
+
             ann_items = []          # 标注图用：(class, score, box, 轴心点)
             seen_cls = {}           # 类别 → 置信度
             for d, own_vocab, conf_voted in dets_all:
