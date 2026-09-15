@@ -1246,6 +1246,23 @@ class GraspPhase:
             return 0, -1, "no response"
         self.log.info("抓取服务返回: success={} stage={} [{}] {}".format(
             res.success, res.stage, STAGE_TEXT.get(res.stage, "未知"), res.message))
+        # ★ 落点核对（2026-09-15）：契约点 vs 抓手**实测**位置，两者都在 base_footprint 里。
+        #   这是"偏差到底在契约点（视觉）这一侧，还是契约点→抓手（规划/执行）这一段"的
+        #   唯一直接判据 —— 之前一直缺这一条，所以只能在两侧之间猜 ✗
+        #   注意：服务返回时通常已经抬升过，z 会变 ⇒ 只比 x/y ✓
+        tcp_end = self.tcp_pose_base()
+        if tcp_end is not None:
+            ddx = tcp_end[0] - target.point.x
+            ddy = tcp_end[1] - target.point.y
+            dd = math.hypot(ddx, ddy)
+            self.log.info(
+                "  ★ 落点核对: 契约点 base({:+.3f},{:+.3f}) vs 抓手实测 base({:+.3f},{:+.3f}) "
+                "→ 差 ({:+.0f},{:+.0f}) mm（|d|={:.0f} mm）{}".format(
+                    target.point.x, target.point.y, tcp_end[0], tcp_end[1],
+                    ddx * 1000.0, ddy * 1000.0, dd * 1000.0,
+                    "   ✓ 抓手确实停在契约点上 ⇒ 偏置在【契约点=视觉】这一侧"
+                    if dd <= 0.015 else
+                    "   ✗ 抓手没落到契约点上 ⇒ 偏置在【契约点→抓手】这一段（规划/执行）"))
         return res.success, res.stage, res.message
 
     # ══════════════ ⑤ 主流程 ══════════════
