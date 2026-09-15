@@ -812,6 +812,54 @@ class DetectGraspTargetNode(Node):
         info["range"] = r_f + back
         return axis, info
 
+    def _size_range_crosscheck(self, cls, mask, depth, k):
+        """★ 已知尺寸测距（判别实验）：完全不用 TF、不用桌面、不用深度尺度。
+
+        圆截面的**轮廓宽度恒等于直径**（与视角无关）⇒ 由掩码宽度反解轴距
+            Z_size = fx · D / W_px      （D = 直径，W_px = 掩码宽像素）
+        深度法在同一次测量里给出另一个轴距：
+            Z_depth = p5(掩码内深度) + r  （p5 是可见面最近处，圆柱那里正好在轴外 r）
+        两者都在**相机系**里、都不经 TF ⇒ 差值直接回答"深度在物体处准不准"：
+          · 差几毫米 ⇒ 深度准 ✓ → 偏差在下游（相机外参平移 / 规划 / 臂）
+          · 差几厘米 ⇒ 深度在物体处不准 ✗ → 偏差在感知（本轮补丁方向）
+        长方体轮廓宽随偏航变，只回报"隐含宽度"与目录区间比 ✓
+        """
+        d, w, h = self.object_sizes.get(cls, (0.0, 0.0, 0.0))
+        if depth is None or k is None or mask is None or d <= 0 or w <= 0:
+            return None
+        ys, xs = np.nonzero(mask.astype(bool))          # 用**原始**掩码（不腐蚀），宽度才准
+        if xs.size < 20:
+            return None
+        # ★ 只取"物体中高那一带"：斜视角下底边比中高近几十毫米 ✗
+        #   尺寸法和深度法必须量同一个点（中高处的轴距），否则差值是几何效应不是误差 ✗
+        v_mid = 0.5 * (float(ys.min()) + float(ys.max()))
+        band = 0.10 * max(4.0, float(ys.max() - ys.min()))
+        sel = np.abs(ys - v_mid) <= band
+        if int(sel.sum()) >= 20:
+            xs_b, ys_b = xs[sel], ys[sel]
+        else:
+            xs_b, ys_b = xs, ys
+        w_px = float(xs_b.max() - xs_b.min() + 1)
+        fx = float(k[0])
+        if fx <= 0 or w_px <= 0:
+            return None
+        zs = depth[ys_b, xs_b].astype(float)
+        zs = zs[np.isfinite(zs) & (zs > 0.0) & (zs < self.max_range)]
+        if zs.size < 20:
+            return None
+        if w_px < 40:                    # 太窄时 1 px 量化误差就是几厘米 ⇒ 不可用，别误导 ✗
+            return dict(w_px=w_px, too_small=True)
+        is_round = abs(d - w) < 0.01
+        r_ax = 0.5 * (d + w) / 2.0 if is_round else 0.5 * min(d, w)
+        z_dep = float(np.percentile(zs, 5)) + r_ax
+        out = dict(w_px=w_px, z_dep=z_dep, implied_d=w_px * z_dep / fx,
+                   expect_lo=min(d, w), expect_hi=math.hypot(d, w))
+        if is_round:
+            out["z_size"] = fx * (0.5 * (d + w)) / w_px      # 圆：直径/2 就是半径 r
+            out["z_size"] -= 0.0
+            out["diff"] = out["z_size"] - z_dep
+        return out
+
     def _table_plane_check(self, depth, k, tf, step=40):
         """★ 桌平面校验：网格取样深度，用平面约束挑出桌面像素，反投影应恒为 support_z。
 
@@ -1143,6 +1191,31 @@ class DetectGraspTargetNode(Node):
                                         else "   ✓ 两法一致"))
                 except Exception as e:                      # noqa: BLE001
                     self.get_logger().warn("  位置核对失败: {}: {}".format(type(e).__name__, e))
+                try:
+                    xc = self._size_range_crosscheck(cls, d.get("mask"), depth, k)
+                    if xc and xc.get("too_small"):
+                        self.get_logger().info(
+                            "  已知尺寸测距[{}]: 掩码只有 {:.0f} px 宽 → 量化误差太大，跳过".format(
+                                cls, xc["w_px"]))
+                    elif xc:
+                        if "z_size" in xc:
+                            same = abs(xc["diff"]) <= 0.020
+                            self.get_logger().info(
+                                "  已知尺寸测距[{}]: 掩码宽 {:.0f} px → 轴距 尺寸法 {:.3f} m "
+                                "vs 深度法 {:.3f} m → 差 {:+.0f} mm{}".format(
+                                    cls, xc["w_px"], xc["z_size"], xc["z_dep"],
+                                    xc["diff"] * 1000.0,
+                                    "   ✓ 深度在物体处也准 ⇒ 偏差在下游(外参平移/规划/臂)"
+                                    if same else
+                                    "   ✗ 差 >20 mm ⇒ 深度在物体处不准，偏差在感知这一侧"))
+                        else:
+                            self.get_logger().info(
+                                "  已知尺寸测距[{}]: 掩码宽 {:.0f} px → 隐含宽度 {:.3f} m "
+                                "（目录 {:.3f}~{:.3f} m）轴距(深度法) {:.3f} m".format(
+                                    cls, xc["w_px"], xc["implied_d"],
+                                    xc["expect_lo"], xc["expect_hi"], xc["z_dep"]))
+                except Exception as e:                      # noqa: BLE001
+                    self.get_logger().warn("  已知尺寸测距失败: {}: {}".format(type(e).__name__, e))
                 conv = self._contract_point(pts_cam, tf, cls)
                 if conv is None:
                     continue

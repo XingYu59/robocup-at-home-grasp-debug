@@ -112,6 +112,7 @@ def fake_node():
     n._rot_of = N._rot_of
     n._plane_z_at = lambda u, v, k, R, t: N._plane_z_at(n, u, v, k, R, t)
     n._backoff = lambda cls, vd, tf: N._backoff(n, cls, vd, tf)
+    n._size_range_crosscheck = lambda cls, mk, dp, kk: N._size_range_crosscheck(n, cls, mk, dp, kk)
     return n
 
 
@@ -142,6 +143,13 @@ def run_case(name, cls, cam_xyz, obj_xy, obj_r=None, obj_hw=None, obj_h=0.115,
     node = fake_node()
     axis, info = D.DetectGraspTargetNode._ground_point(node, cls, mask, K, tf)
     chk = D.DetectGraspTargetNode._table_plane_check(node, depth, K, tf)
+    xc = D.DetectGraspTargetNode._size_range_crosscheck(node, cls, mask, depth, K)
+    if xc and "z_size" in xc:
+        print("  已知尺寸测距: 掩码宽 {:.0f} px → 轴距 尺寸法 {:.3f} m vs 深度法 {:.3f} m "
+              "→ 差 {:+.0f} mm".format(xc["w_px"], xc["z_size"], xc["z_dep"], xc["diff"] * 1000))
+    elif xc:
+        print("  已知尺寸测距: 掩码宽 {:.0f} px → 隐含宽度 {:.3f} m（目录 {:.3f}~{:.3f}）".format(
+            xc["w_px"], xc["implied_d"], xc["expect_lo"], xc["expect_hi"]))
     err = None if axis is None else (axis[0] - obj_xy[0], axis[1] - obj_xy[1])
     print("\n── {} ──".format(name))
     print("  相机 base=({:.2f},{:.2f},{:.2f}) 高桌面 {:.3f} m  掩码 {} px"
