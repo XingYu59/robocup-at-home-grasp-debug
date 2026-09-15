@@ -161,3 +161,26 @@ ros2 run turtlebot3_manipulation_navigation2 dining_grasp_task.py --keep-pose --
 3. 视觉对小物体的召回（§3 问题 3）
 4. `sugar_box` 可视/碰撞不一致 → 找裁判/模型所有者确认（§3 问题 4）
 5. 计时预算复盘：视觉一次 ~60 s，整条抓取阶段目前 ~4~6 min（含 3~4 次视觉调用），比赛限时内是否够
+
+---
+
+## 8. 最后一批改动（**已实现 + 冒烟测试通过，但还没跑过完整验证** ✅待验证）
+
+接手调试的人请先看这一节：以下都改了代码，但**没有在仿真里验证过** ✓
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| **近看位"原地多角度扫视 + 按 map 合并"** | `grasp_phase.py` | 走到离桌心 0.68 m 后原地转 ±25°（3 个角度）各检测一次，同类且 map 相距 <8 cm 视为同一物体（保留高置信度），最后转回原朝向。**并集覆盖 ±56° ⇒ 0.68 m 处 ±1.0 m，整张桌进得来；物体 0.6~0.8 m ⇒ 罐子约 60~90 像素**（原来 1.14 m 处只有 29 像素、认不出 ✗）。新增常量 `SURVEY_YAWS`/`SURVEY_MERGE_DIST`，函数 `_rotate_by()`/`survey_targets()`，接入两处回退（没目标 / 没候选）|
+| 支撑面**单一来源** | `grasp_phase.py` + `grasp_params.yaml` | orchestration 侧原来硬编码 dinning_table_3 ✗ → 现在两边都读 `grasp_params.yaml:support_surface` ✓（换桌子只改一行；`NEIGHBOR_TABLES` 邻居桌排除只在餐厅那三张桌子时启用）|
+| 视觉**一个目标都没返回**时也自动靠近重试 | `grasp_phase.py` | 原来直接结束 ✗ |
+| 世界：餐桌3 的 `pudding_box` → `tomato_soup_can` | `wpr_simulation_ros2/worlds/example.world` | 经用户批准；备份 `example.world.bak_before_can`。现在餐桌3 = `bowl`（夹不住）+ **`tomato_soup_can`（2.3, 2.0）** + `sugar_box`（3.1, 2.0）|
+
+**验证这几点的方法**：
+```bash
+# 终端1 重启（拿新世界里的罐子）→ 终端2/3 照旧 → 终端4：
+ros2 run turtlebot3_manipulation_navigation2 dining_grasp_task.py --classes "tomato_soup_can"
+```
+- 日志里应出现 `近看位扫视（转 3 个角度…）`、`扫视[i/3] …`、`扫视合并后: N 个`
+- 若罐子出现在结果里 ⇒ 扫视有效 ✓；再用 `两指真实间距` 那一行判有没有夹到（§0/§5）
+
+> 本地提交状态：`d7ab642`（扫视）等提交**只在本地** ✓（用户要求暂不推送 ✓）
