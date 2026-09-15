@@ -622,7 +622,7 @@ class DetectGraspTargetNode(Node):
             [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
         ])
 
-    def _mask_points_cam(self, mask, depth, k, cls=None):
+    def _mask_points_cam(self, mask, depth, k, cls=None, patch=False):
         """掩码 + 深度 → 相机光学系点云（N×3），返回 (pts, ys, stats)。
 
         ★ 2026-09-15 补丁①【距离闸门】：只留"物体自己那一簇"深度。
@@ -637,7 +637,9 @@ class DetectGraspTargetNode(Node):
             return None
         stats = {}
         m = mask.astype(bool)
-        ep = int(self.mask_erode_px)
+        # ★ patch=False ⇒ 完全走原逻辑（队友/计数任务那条路）：
+        #   不腐蚀、不加距离闸门 ⇒ 返回的点云与补丁前逐字节一致 ✓
+        ep = int(self.mask_erode_px) if patch else 0
         if ep > 0 and m.sum() > 60:
             try:
                 import cv2
@@ -657,7 +659,7 @@ class DetectGraspTargetNode(Node):
             return None
         xs, ys, zs = xs[ok], ys[ok], zs[ok]
         n0 = int(zs.size)
-        if cls in self.object_sizes and n0 >= 40:
+        if patch and cls in self.object_sizes and n0 >= 40:
             d, w, h = self.object_sizes[cls]
             ext = max([x for x in (d, w, h) if x > 0] or [0.2])
             z_lo = float(np.percentile(zs, 20))
@@ -1103,7 +1105,7 @@ class DetectGraspTargetNode(Node):
             want = [c for c in (request.class_ids or []) if c]
             k = info_msg.k
             # ★ 桌平面校验（一次调用一条）：深度+内参+外参+支撑面高度 四者同时验证
-            if self.table_check:
+            if self.table_check and want:
                 chk = self._table_plane_check(depth, k, tf)
                 if chk is None:
                     self.get_logger().warn(
@@ -1133,7 +1135,7 @@ class DetectGraspTargetNode(Node):
                     continue
                 if seen_cls.get(cls, -1.0) >= float(conf_voted):
                     continue                       # 同类已有更高置信度的框
-                got = self._mask_points_cam(d.get("mask"), depth, k, cls)
+                got = self._mask_points_cam(d.get("mask"), depth, k, cls, patch=bool(own_vocab))
                 if got is None:
                     self.get_logger().warn("  {} 掩码处没有有效深度，跳过".format(cls))
                     continue
@@ -1192,7 +1194,8 @@ class DetectGraspTargetNode(Node):
                 except Exception as e:                      # noqa: BLE001
                     self.get_logger().warn("  位置核对失败: {}: {}".format(type(e).__name__, e))
                 try:
-                    xc = self._size_range_crosscheck(cls, d.get("mask"), depth, k)
+                    xc = (None if not own_vocab else
+                          self._size_range_crosscheck(cls, d.get("mask"), depth, k))
                     if xc and xc.get("too_small"):
                         self.get_logger().info(
                             "  已知尺寸测距[{}]: 掩码只有 {:.0f} px 宽 → 量化误差太大，跳过".format(
@@ -1222,7 +1225,8 @@ class DetectGraspTargetNode(Node):
                 point, centroid_tgt, back = conv
                 # ★ 补丁③ 地面约束测距 vs 掩码法：两条独立链路的结果都打出来，
                 #   差值就是"位置偏置"的自检指标（两法都偏远 ⇒ 偏置在共用的外参/桌面假设上）
-                gp, ginfo = self._ground_point(cls, d.get("mask"), k, tf)
+                gp, ginfo = ((None, {}) if not own_vocab
+                             else self._ground_point(cls, d.get("mask"), k, tf))
                 if gp is not None:
                     drift = float(math.hypot(gp[0] - point[0], gp[1] - point[1]))
                     ok_p = bool(ginfo.get("ok"))
