@@ -589,7 +589,7 @@ class GraspPhase:
 
     # ══════════════ ② 选目标（硬过滤 + 档位 + 并列时排序）══════════════
     @staticmethod
-    def _on_support(p_map, margin=0.15):
+    def _on_support(p_map, margin=0.30):
         """目标是否落在支撑面（餐桌 dinning_table_3）足迹内（带容差，吸收 AMCL 误差）。
 
         ★ 必须有这道校验：站在观察位面朝餐桌时，相机水平视野 62°，会**同时看到左右
