@@ -136,6 +136,20 @@ def support_surface_z_from_params(params_path, default=0.78):
     return default
 
 
+def _yaw_from_params(params_path, default=0.0):
+    """grasp_params.yaml 的 object_yaw_map（物体在 map 里的偏航，本世界全轴对齐 ⇒ 0）。"""
+    if not params_path or not os.path.isfile(params_path):
+        return default
+    try:
+        import yaml
+        doc = yaml.safe_load(open(params_path, encoding="utf-8")) or {}
+        rp = (doc.get("/**") or {}).get("ros__parameters") or doc.get("ros__parameters") or {}
+        v = rp.get("object_yaw_map")
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
+
 class DetectGraspTargetNode(Node):
     """提供 /detect_grasp_target 服务：检测 + 3D 定位 + 换算成契约点。"""
 
@@ -172,6 +186,21 @@ class DetectGraspTargetNode(Node):
         # 为什么：假阳性是逐帧随机的（这帧冒 tuna fish can，下帧就没了），真目标稳定出现 ✓
         # 代价：每帧 ~4~9 s，N=3 大约多花 8~18 s
         self.declare_parameter("vote_frames", 3)
+        # ── ★ 位置补丁（2026-09-15）：位置估计的三处改动 ────────────
+        # 现场症状：糖盒/番茄罐都"夹空"，实测合爪间距=指令值 ⇒ 两指之间没有东西；
+        # 反推真值必须偏 ≥44 mm（径向）/≥60 mm（横向）才能夹空，而两条独立估计
+        # （掩码法/框心法）彼此只差 1~15 mm ⇒ 是**共同偏置**，不是随机噪声。
+        # 三个补丁，各自独立、可单独关掉做 A/B：
+        #  ① position_source=plane：改用【地面约束测距】（掩码底边 + 已知桌面高度，
+        #     完全不用深度图）——与深度链路独立，天然躲开"掩码吃进桌面/背景导致偏远"
+        #  ② mask_erode_px：掩码先腐蚀几像素，躲开彩色/深度不对齐的毛边
+        #  ③ 距离闸门（在 _mask_points_cam 里，无需参数）：只留物体自己那一簇深度
+        self.declare_parameter("position_source", "auto")   # auto | plane | mask
+        self.declare_parameter("mask_erode_px", 2)
+        self.declare_parameter("plane_min_den", 0.10)       # 平面约束条件数下限
+        self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
+        self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
+        self.declare_parameter("map_frame", "map")
         # 评分要求"在仿真相机画面或等效可视化里框出拟抓取目标、标注物品名称" →
         # 每次检测把带框+类别文字的图发出来并存盘，作为可核查的证据 ✓
         self.declare_parameter("annotated_topic", "/detect_grasp_target/annotated_image")
@@ -196,6 +225,13 @@ class DetectGraspTargetNode(Node):
         self.size_lo = float(p("size_ratio_lo"))
         self.size_hi = float(p("size_ratio_hi"))
         self.vote_frames = max(1, int(p("vote_frames")))
+        self.position_source = str(p("position_source") or "auto").lower()
+        self.mask_erode_px = max(0, int(p("mask_erode_px")))
+        self.plane_min_den = float(p("plane_min_den"))
+        self.yaw_backoff = bool(p("yaw_backoff"))
+        self.table_check = bool(p("table_check"))
+        self.map_frame = str(p("map_frame") or "map")
+        self.object_yaw_map = _yaw_from_params(cfg_params)
         # 抓取模式的 prompt：objects.yaml 的全部类别名（下划线换成空格，GroundingDINO 好认）
         self.grasp_prompt = " . ".join(c.replace("_", " ") for c in sorted(self.catalog)) + " ."
         self.get_logger().info("抓取模式={} 全类别 prompt={}".format(
@@ -575,24 +611,240 @@ class DetectGraspTargetNode(Node):
                     continue
         return None
 
-    def _mask_points_cam(self, mask, depth, k):
-        """掩码 + 深度 → 相机光学系点云（N×3）。掩码/内参不匹配返回 None。"""
+    @staticmethod
+    def _rot_of(tf):
+        """TF → 3×3 旋转矩阵（相机光学系 → target_frame）。"""
+        q = tf.transform.rotation
+        qx, qy, qz, qw = q.x, q.y, q.z, q.w
+        return np.array([
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+        ])
+
+    def _mask_points_cam(self, mask, depth, k, cls=None):
+        """掩码 + 深度 → 相机光学系点云（N×3），返回 (pts, ys, stats)。
+
+        ★ 2026-09-15 补丁①【距离闸门】：只留"物体自己那一簇"深度。
+          掩码里混进的桌面/背景都比物体**远** ⇒ 以 20% 分位（对少量近处毛刺免疫）
+          为前缘，只保留 [前缘, 前缘 + 物体最大尺寸 + 3 cm] 以内的像素 ✓
+          stats 回报剔除比例：剔得多 ⇒ 掩码确实在吃背景（"偏远"的直接证据 ✓）
+        ★ 补丁②【腐蚀】：掩码先腐蚀几像素，躲开彩色/深度不对齐的毛边
+        """
         if mask is None or depth is None:
             return None
         if mask.shape[:2] != depth.shape[:2]:
             return None
-        ys, xs = np.nonzero(mask.astype(bool))
+        stats = {}
+        m = mask.astype(bool)
+        ep = int(self.mask_erode_px)
+        if ep > 0 and m.sum() > 60:
+            try:
+                import cv2
+                kk = np.ones((2 * ep + 1, 2 * ep + 1), np.uint8)
+                e = cv2.erode(m.astype(np.uint8), kk).astype(bool)
+                if e.sum() >= max(20, 0.25 * m.sum()):
+                    m = e
+                    stats["erode"] = ep
+            except Exception:                      # noqa: BLE001
+                pass
+        ys, xs = np.nonzero(m)
         if xs.size == 0:
             return None
-        zs = depth[ys, xs]
+        zs = depth[ys, xs].astype(float)
         ok = np.isfinite(zs) & (zs > 0.0) & (zs < self.max_range)
         if not np.any(ok):
             return None
         xs, ys, zs = xs[ok], ys[ok], zs[ok]
+        n0 = int(zs.size)
+        if cls in self.object_sizes and n0 >= 40:
+            d, w, h = self.object_sizes[cls]
+            ext = max([x for x in (d, w, h) if x > 0] or [0.2])
+            z_lo = float(np.percentile(zs, 20))
+            keep = zs <= (z_lo + ext + 0.03)
+            if int(keep.sum()) >= 20:
+                stats["z_lo"] = z_lo
+                stats["drop_far"] = 1.0 - float(keep.sum()) / float(n0)
+                xs, ys, zs = xs[keep], ys[keep], zs[keep]
         fx, cx, fy, cy = k[0], k[2], k[4], k[5]
         if fx <= 0 or fy <= 0:
             return None
-        return np.stack([(xs - cx) * zs / fx, (ys - cy) * zs / fy, zs], axis=1), ys
+        pts = np.stack([(xs - cx) * zs / fx, (ys - cy) * zs / fy, zs], axis=1)
+        return pts, ys, stats
+
+    def _plane_z_at(self, u, v, k, R, t_base):
+        """像素 (u,v) 若落在支撑面 z=support_z 上，反解深度 Z（不用深度图）。
+
+        相机系点 p = Z·((u-cx)/fx, (v-cy)/fy, 1)；base 系 z 分量 = R[2,:]·p + t_z
+        令其 = support_z ⇒ Z = (support_z - t_z) / (R[2,:]·(...)) ✓
+        返回 (Z | None, den)：|den| 太小 ⇒ 视线几乎与桌面平行，解极不稳定 ✗
+        """
+        fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+        den = R[2, 0] * (u - cx) / fx + R[2, 1] * (v - cy) / fy + R[2, 2]
+        if abs(den) < self.plane_min_den:
+            return None, float(den)
+        Z = (self.support_z - t_base[2]) / den
+        if not (0.05 < Z < self.max_range):
+            return None, float(den)
+        return float(Z), float(den)
+
+    def _backoff(self, cls, view_dir_base, tf):
+        """可见面 → 物体轴心 的水平后退量（米）+ 依据说明。
+
+        · 圆截面（d≈w）：任何水平视角下切平面都在轴外 r ⇒ 后退 r ✓
+        · 长方体：后退量 = 支撑函数 (d/2)|cosφ| + (w/2)|sinφ|
+          φ = 视线与物体 x 轴夹角（物体偏航 = object_yaw_map − map→base 的偏航）
+          拿不到偏航时退化为圆周平均 (d+w)/π ✓（min(d,w)/2 是**下界**，
+          斜看薄边时会少退 2 cm 以上 ✗）
+        """
+        d, w, h = self.object_sizes.get(cls, (0.0, 0.0, 0.0))
+        if d <= 0 or w <= 0:
+            return 0.0, "目录无尺寸"
+        if abs(d - w) < 0.01:
+            return 0.5 * max(d, w), "圆截面 r={:.3f}".format(0.5 * max(d, w))
+        yaw_base = None
+        try:
+            tr = self._tf_buffer.lookup_transform(self.target_frame, self.map_frame, Time())
+            q = tr.transform.rotation
+            yaw_map_to_base = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                         1 - 2 * (q.y * q.y + q.z * q.z))
+            yaw_base = self.object_yaw_map - yaw_map_to_base
+        except Exception:                          # noqa: BLE001
+            yaw_base = None
+        if yaw_base is None or not self.yaw_backoff:
+            return (d + w) / math.pi, "圆周平均 (d+w)/π"
+        cphi = abs(math.cos(yaw_base) * view_dir_base[0] + math.sin(yaw_base) * view_dir_base[1])
+        cphi = min(1.0, max(0.0, cphi))
+        sphi = math.sqrt(max(0.0, 1.0 - cphi * cphi))
+        return 0.5 * d * cphi + 0.5 * w * sphi, "支撑函数 φ={:.0f}°".format(
+            math.degrees(math.acos(cphi)))
+
+    def _ground_point(self, cls, mask, k, tf):
+        """★ 补丁③【地面约束测距】：掩码底边 + 已知桌面高度 → 物体轴心点。
+
+        完全不看深度图：物体"底边"像素落在桌面平面上（z=support_z 已知）
+        ⇒ 由内参+相机外参反解该像素的深度，再反投影出底边前缘点，
+        沿水平视线后退"可见面→轴心"的距离即轴心 ✓
+        与深度链路独立 ⇒ 可交叉验证"位置偏远"到底出自深度还是掩码 ✗
+        返回 (axis_base | None, info)
+        """
+        info = {}
+        if mask is None or k is None or tf is None:
+            return None, info
+        m = mask.astype(bool)
+        ys, xs = np.nonzero(m)
+        if xs.size < 30:
+            info["why"] = "掩码太小"
+            return None, info
+        u0, u1 = int(xs.min()), int(xs.max())
+        wpx = u1 - u0 + 1
+        lo, hi = u0 + int(0.25 * wpx), u0 + int(0.75 * wpx)
+        if hi - lo < 3:
+            lo, hi = u0, u1
+        R = self._rot_of(tf)
+        tr = tf.transform.translation
+        t_base = np.array([tr.x, tr.y, tr.z])
+        info["cam_h"] = float(t_base[2] - self.support_z)
+        Zs, front = [], []
+        fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+        for u in range(lo, hi + 1):
+            col = np.nonzero(m[:, u])[0]
+            if col.size == 0:
+                continue
+            v = float(col.max())                   # 该列底边像素 = 物体与桌面接触处
+            Z, _ = self._plane_z_at(u, v, k, R, t_base)
+            if Z is None:
+                continue
+            pc = np.array([(u - cx) * Z / fx, (v - cy) * Z / fy, Z])
+            front.append(R.dot(pc) + t_base)
+            Zs.append(Z)
+        if len(Zs) < 5:
+            info["why"] = "底边可解像素不足({})".format(len(Zs))
+            return None, info
+        info["Z_med"] = float(np.median(Zs))
+        info["jitter"] = float(np.percentile(Zs, 90) - np.percentile(Zs, 10))
+        front_pts = np.stack(front, axis=0)         # 底边各列的前缘点（base 系，都在桌面上）
+        c = front_pts.mean(axis=0)
+        c[2] = t_base[2]
+        v_ray = c - t_base
+        v_ray[2] = 0.0
+        n = float(np.linalg.norm(v_ray))
+        if n < 1e-6:
+            info["why"] = "视线退化"
+            return None, info
+        v_ray = v_ray / n
+        s_hat = np.array([-v_ray[1], v_ray[0], 0.0])
+        rel = front_pts - t_base
+        rel[:, 2] = 0.0
+        r_i = rel.dot(v_ray)                        # 沿视线距离
+        s_i = rel.dot(s_hat)                        # 横向偏移
+        # ★ 可见面 = 切平面 ⇒ 取沿视线的【近端分位】，不用中位数：
+        #   斜看长方体时底边轮廓从"近角"拖到"远角"（跨度可达 9 cm），
+        #   中位数落在物体中段 ⇒ 位置整体偏后 1 cm 以上 ✗
+        r_f = float(np.percentile(r_i, 15))
+        s_c = float(np.median(s_i))
+        info["r_near"] = float(np.percentile(r_i, 5))
+        info["jitter"] = float(np.percentile(r_i, 90) - np.percentile(r_i, 10))
+        info["lat_half"] = 0.5 * float(np.percentile(s_i, 95) - np.percentile(s_i, 5))
+        p_front = t_base + v_ray * r_f + s_hat * s_c
+        p_front[2] = self.support_z
+        info["front"] = p_front
+        # ★ 置信判据：底边沿视线的跨度不能超过物体自身脚印对角线 + 5 cm
+        #   （超了说明掩码吃进了桌面/背景——那正是"位置偏远"的可测特征 ✓）
+        d0, w0, _h0 = self.object_sizes.get(cls, (0.0, 0.0, 0.0))
+        diag = math.hypot(d0, w0) if (d0 > 0 and w0 > 0) else 0.30
+        cam_h = float(t_base[2] - self.support_z)
+        why_bad = []
+        if cam_h <= 0.08:
+            why_bad.append("相机离桌面仅 {:.0f}mm（视线太平，解不稳定）".format(cam_h * 1000))
+        if info["jitter"] > diag + 0.05:
+            why_bad.append("底边跨度 {:.0f}mm > 物体对角线 {:.0f}mm+50mm（吃进桌面/背景）"
+                           .format(info["jitter"] * 1000, diag * 1000))
+        info["ok"] = not why_bad
+        if why_bad:
+            info["why"] = "；".join(why_bad)
+        back, why = self._backoff(cls, v_ray, tf)
+        info["back"] = float(back)
+        info["back_why"] = why
+        info["range_front"] = r_f
+        axis = p_front + v_ray * back
+        axis[2] = self.support_z
+        info["range"] = r_f + back
+        return axis, info
+
+    def _table_plane_check(self, depth, k, tf, step=40):
+        """★ 桌平面校验：网格取样深度，用平面约束挑出桌面像素，反投影应恒为 support_z。
+
+        一次同时验证：深度尺度/编码 ✓ 内参 ✓ 相机外参 ✓ 支撑面高度 ✓
+        · z 随像素行线性变化（斜率大）⇒ 外参俯仰/内参有问题
+        · 只是整体偏移 ⇒ 相机高度或支撑面高度有问题
+        """
+        if depth is None or k is None or tf is None:
+            return None
+        R = self._rot_of(tf)
+        tr = tf.transform.translation
+        t_base = np.array([tr.x, tr.y, tr.z])
+        h, w = depth.shape[:2]
+        rows, zs = [], []
+        for v in range(step // 2, h, step):
+            for u in range(step // 2, w, step):
+                Zm = float(depth[v, u])
+                if not np.isfinite(Zm) or Zm <= 0.0 or Zm >= self.max_range:
+                    continue
+                Zp, _ = self._plane_z_at(u, v, k, R, t_base)
+                if Zp is None or abs(Zm - Zp) > 0.03:
+                    continue                        # 不在支撑面附近 ⇒ 不是桌面像素
+                fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+                pc = np.array([(u - cx) * Zm / fx, (v - cy) * Zm / fy, Zm])
+                rows.append(float(v))
+                zs.append(float((R.dot(pc) + t_base)[2]))
+        if len(zs) < 20:
+            return None
+        zs_a = np.array(zs)
+        coef = np.polyfit(np.array(rows), zs_a, 1)
+        return dict(n=int(zs_a.size), mean=float(zs_a.mean()), std=float(zs_a.std()),
+                    slope=float(coef[0]), cam_h=float(t_base[2] - self.support_z))
+
 
     def _contract_point(self, pts_cam, tf, cls, bottom_band=False):
         """相机系点云 → 契约点（物体中心轴 ∩ 支撑面，在 target_frame 里）。
@@ -677,6 +929,22 @@ class DetectGraspTargetNode(Node):
                     self.camera_frame, self.target_frame)
                 self.get_logger().error(response.message)
                 return response
+
+            # ★ 桌平面校验（一次调用一条）：深度+内参+外参+支撑面高度 四者同时验证
+            if self.table_check:
+                chk = self._table_plane_check(depth, k, tf)
+                if chk is None:
+                    self.get_logger().warn(
+                        "  桌平面校验：找不到足够的桌面像素（相机没对着桌面？）")
+                else:
+                    bad = abs(chk["mean"] - self.support_z) > 0.010 or abs(chk["slope"]) > 0.002
+                    self.get_logger().info(
+                        "  桌平面校验: {} 个桌面像素 → 反投影 z={:.4f}±{:.4f} m "
+                        "（配置 {:.3f}，差 {:+.0f} mm；随像素行斜率 {:.2f} mm/px）{}".format(
+                            chk["n"], chk["mean"], chk["std"], self.support_z,
+                            (chk["mean"] - self.support_z) * 1000.0, chk["slope"] * 1000.0,
+                            "   ✗ 深度/外参/桌面高度有不一致，位置必然偏"
+                            if bad else "   ✓ 四者一致"))
 
             # ══════════ 检测：多帧投票（+ 抓取模式的窄词表复核）══════════
             # 帧级检测函数：返回 {class: (conf, det)}（同一类取该帧里分最高的框）
@@ -817,11 +1085,16 @@ class DetectGraspTargetNode(Node):
                     continue
                 if seen_cls.get(cls, -1.0) >= float(conf_voted):
                     continue                       # 同类已有更高置信度的框
-                got = self._mask_points_cam(d.get("mask"), depth, k)
+                got = self._mask_points_cam(d.get("mask"), depth, k, cls)
                 if got is None:
                     self.get_logger().warn("  {} 掩码处没有有效深度，跳过".format(cls))
                     continue
-                pts_cam, ys = got
+                pts_cam, ys, mstats = got
+                if mstats.get("drop_far", 0.0) > 0.02:
+                    self.get_logger().warn(
+                        "  距离闸门[{}]: 剔除 {}% 远处像素（前缘 {:.3f} m）→ 掩码确实在吃"
+                        "桌面/背景；已剔除 ✓".format(
+                            cls, 100.0 * mstats["drop_far"], mstats.get("z_lo", 0.0)))
                 ok_size, obs, rng = self._size_ok(cls, pts_cam)
                 if not ok_size:
                     self.get_logger().warn(
@@ -874,6 +1147,35 @@ class DetectGraspTargetNode(Node):
                 if conv is None:
                     continue
                 point, centroid_tgt, back = conv
+                # ★ 补丁③ 地面约束测距 vs 掩码法：两条独立链路的结果都打出来，
+                #   差值就是"位置偏置"的自检指标（两法都偏远 ⇒ 偏置在共用的外参/桌面假设上）
+                gp, ginfo = self._ground_point(cls, d.get("mask"), k, tf)
+                if gp is not None:
+                    drift = float(math.hypot(gp[0] - point[0], gp[1] - point[1]))
+                    ok_p = bool(ginfo.get("ok"))
+                    self.get_logger().info(
+                        "  地面测距[{}]: 轴心 base({:+.3f},{:+.3f}) 前缘 {:.3f} m "
+                        "后退 {:.0f}mm（{}）底边跨度 {:.0f}mm 影宽 {:.0f}mm 相机高 {:.0f}mm "
+                        "→ 与掩码法差 {:.0f} mm{}".format(
+                            cls, gp[0], gp[1], ginfo.get("range_front", 0.0),
+                            ginfo.get("back", 0.0) * 1000.0, ginfo.get("back_why", ""),
+                            ginfo.get("jitter", 0.0) * 1000.0,
+                            ginfo.get("lat_half", 0.0) * 2000.0,
+                            ginfo.get("cam_h", 0.0) * 1000.0, drift * 1000.0,
+                            "" if ok_p else "   ✗ {}，本次不采用".format(ginfo.get("why", ""))))
+                    if self.position_source == "plane" or (
+                            self.position_source == "auto" and ok_p):
+                        point = gp
+                        centroid_tgt = ginfo["front"]
+                        back = ginfo["back"]
+                        self.get_logger().info("  → 采用【地面测距】({})".format(
+                            ginfo.get("back_why", "")))
+                    else:
+                        self.get_logger().info("  → 采用【掩码法】（position_source={}）".format(
+                            self.position_source))
+                elif self.position_source == "plane":
+                    self.get_logger().warn("  地面测距[{}]不可用（{}）→ 回退掩码法".format(
+                        cls, ginfo.get("why", "?")))
                 tgt = GraspTargetStamped()
                 tgt.header.frame_id = self.target_frame
                 tgt.header.stamp = self.get_clock().now().to_msg()   # 本次检测时刻
