@@ -439,6 +439,27 @@ class GraspPhase:
         except Exception:
             return None
 
+    def tcp_axes_base(self):
+        """指尖坐标系的 z 轴（接近方向）与 y 轴（两指合拢方向）在 base 里的单位向量。
+
+        为什么需要：现场观察到"夹爪角度有问题"（手指不是水平地夹住罐子）✗
+        · 顶抓时 z 轴应竖直（与 base 的 z 夹角 ≈0° 或 180°）
+        · 两指合拢方向 y 轴应水平（与水平面夹角 ≈0°）
+        这两个角一旦偏，两指就会斜着夹（先碰罐口沿、再把它挤走）——
+        位置对、角度错时，日志里的"位置核对"和"尺寸测距"都看不出来 ✗
+        """
+        if self.tf_buffer is None:
+            return None
+        try:
+            tr = self.tf_buffer.lookup_transform("base_footprint", "fr3_hand_tcp", Time())
+            q = tr.transform.rotation
+            x, y, z, w = q.x, q.y, q.z, q.w
+            z_ax = (2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y))
+            y_ax = (2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w))
+            return z_ax, y_ax
+        except Exception:
+            return None
+
     def finger_gap_mm(self):
         """两指【真实间距】(mm)：直接量 fr3_leftfinger 与 fr3_rightfinger 两个帧的距离。
 
@@ -1180,6 +1201,7 @@ class GraspPhase:
         #   home 位姿的指尖 z(0.914) 比抓取位姿(0.9195) 还低 → 只留最小 z 会永远
         #   记成 home 位姿（实测踩过，害我误判"机械臂没到位" ✗）
         tcp_xs, tcp_ys, tcp_zs = [], [], []
+        d_best, ax_best = None, None
         if gap0 is not None:
             self.log.info("  合爪前两指真实间距 = {:.1f} mm；指尖平面 base({:+.3f},{:+.3f},{:.3f})"
                           .format(gap0, tcp0[0], tcp0[1], tcp0[2]) if tcp0 else
@@ -1202,6 +1224,10 @@ class GraspPhase:
                 tcp_xs.append(tp[0])
                 tcp_ys.append(tp[1])
                 tcp_zs.append(tp[2])
+                d_now = math.hypot(tp[0] - target.point.x, tp[1] - target.point.y)
+                if d_best is None or d_now < d_best:      # 最接近契约点那次的姿态
+                    d_best = d_now
+                    ax_best = self.tcp_axes_base()
             time.sleep(0.1)
         if not fut.done():
             self.log.error("抓取服务超时（>{:.0f}s）".format(GRASP_SERVICE_TIMEOUT))
@@ -1251,6 +1277,17 @@ class GraspPhase:
         #   这是"偏差到底在契约点（视觉）这一侧，还是契约点→抓手（规划/执行）这一段"的
         #   唯一直接判据 —— 之前一直缺这一条，所以只能在两侧之间猜 ✗
         #   注意：服务返回时通常已经抬升过，z 会变 ⇒ 只比 x/y ✓
+        # ★ 姿态核对（2026-09-15）：位置对但角度错时，前面所有对数都看不出来 ✗
+        if ax_best is not None:
+            zax, yax = ax_best
+            zt = math.degrees(math.acos(max(-1.0, min(1.0, abs(zax[2])))))
+            yt = math.degrees(math.asin(max(-1.0, min(1.0, abs(yax[2])))))
+            self.log.info(
+                "  ★ 姿态核对: 接近方向 z 轴 base({:+.2f},{:+.2f},{:+.2f}) 偏竖直 {:.1f}°；"
+                "两指合拢方向 y 轴 base({:+.2f},{:+.2f},{:+.2f}) 偏水平 {:.1f}°{}".format(
+                    zax[0], zax[1], zax[2], zt, yax[0], yax[1], yax[2], yt,
+                    "   ✓ 顶抓姿态正常" if (zt < 8.0 and yt < 8.0) else
+                    "   ✗ 角度偏了：两指不是水平合拢 ⇒ 会先碰罐口沿/挤走物体（现场观察吻合）"))
         # ★ 落点核对：必须用【轨迹里最接近契约点的那一次采样】，不能用服务返回后的采样 ✗
         #   实测踩坑：服务返回时已经后退 16 cm ⇒ 报出"差 -160 mm"的假警 ✗
         if tcp_xs:
