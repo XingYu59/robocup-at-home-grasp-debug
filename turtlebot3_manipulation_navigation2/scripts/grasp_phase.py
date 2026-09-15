@@ -1179,7 +1179,7 @@ class GraspPhase:
         # ★ 记轨迹范围（min/max），不能只留"z 最小"的那一次 ✗：
         #   home 位姿的指尖 z(0.914) 比抓取位姿(0.9195) 还低 → 只留最小 z 会永远
         #   记成 home 位姿（实测踩过，害我误判"机械臂没到位" ✗）
-        tcp_xs, tcp_zs = [], []
+        tcp_xs, tcp_ys, tcp_zs = [], [], []
         if gap0 is not None:
             self.log.info("  合爪前两指真实间距 = {:.1f} mm；指尖平面 base({:+.3f},{:+.3f},{:.3f})"
                           .format(gap0, tcp0[0], tcp0[1], tcp0[2]) if tcp0 else
@@ -1200,6 +1200,7 @@ class GraspPhase:
             tp = self.tcp_pose_base()
             if tp is not None:
                 tcp_xs.append(tp[0])
+                tcp_ys.append(tp[1])
                 tcp_zs.append(tp[2])
             time.sleep(0.1)
         if not fut.done():
@@ -1250,19 +1251,23 @@ class GraspPhase:
         #   这是"偏差到底在契约点（视觉）这一侧，还是契约点→抓手（规划/执行）这一段"的
         #   唯一直接判据 —— 之前一直缺这一条，所以只能在两侧之间猜 ✗
         #   注意：服务返回时通常已经抬升过，z 会变 ⇒ 只比 x/y ✓
-        tcp_end = self.tcp_pose_base()
-        if tcp_end is not None:
-            ddx = tcp_end[0] - target.point.x
-            ddy = tcp_end[1] - target.point.y
+        # ★ 落点核对：必须用【轨迹里最接近契约点的那一次采样】，不能用服务返回后的采样 ✗
+        #   实测踩坑：服务返回时已经后退 16 cm ⇒ 报出"差 -160 mm"的假警 ✗
+        if tcp_xs:
+            i = min(range(len(tcp_xs)),
+                    key=lambda k: math.hypot(tcp_xs[k] - target.point.x,
+                                             tcp_ys[k] - target.point.y))
+            ddx = tcp_xs[i] - target.point.x
+            ddy = tcp_ys[i] - target.point.y
             dd = math.hypot(ddx, ddy)
             self.log.info(
-                "  ★ 落点核对: 契约点 base({:+.3f},{:+.3f}) vs 抓手实测 base({:+.3f},{:+.3f}) "
+                "  ★ 落点核对: 契约点 base({:+.3f},{:+.3f}) vs 抓手最接近处 base({:+.3f},{:+.3f}) "
                 "→ 差 ({:+.0f},{:+.0f}) mm（|d|={:.0f} mm）{}".format(
-                    target.point.x, target.point.y, tcp_end[0], tcp_end[1],
+                    target.point.x, target.point.y, tcp_xs[i], tcp_ys[i],
                     ddx * 1000.0, ddy * 1000.0, dd * 1000.0,
-                    "   ✓ 抓手确实停在契约点上 ⇒ 偏置在【契约点=视觉】这一侧"
+                    "   ✓ 规划/执行确实把夹爪送到了契约点 ⇒ 剩下的是【契约点=视觉】这一侧"
                     if dd <= 0.015 else
-                    "   ✗ 抓手没落到契约点上 ⇒ 偏置在【契约点→抓手】这一段（规划/执行）"))
+                    "   ✗ 夹爪没到契约点 ⇒ 偏置在【契约点→夹爪】这一段（规划/执行）"))
         return res.success, res.stage, res.message
 
     # ══════════════ ⑤ 主流程 ══════════════
