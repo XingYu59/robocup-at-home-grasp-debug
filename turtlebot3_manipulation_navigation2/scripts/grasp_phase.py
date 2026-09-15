@@ -69,6 +69,12 @@ OBSERVATION_DIST = 1.15     # m，观察位到桌心的距离（Nav2 停偏 0.4 
 #   mustard_bottle/sugar_box 能到 0.84 ✓。物体在 640x480 画面里只有几十像素 →
 #   置信度是【距离】的函数。所以观察位一个都不够格时，再靠近到近看位重看一次。
 CLOSE_LOOK_DIST = 0.68      # m，近看位到桌心的距离（≈ 桌沿外 0.43 m、离物体 0.7~0.9 m）
+# ★ 近看位上的【多角度扫视】：单个视场 62° 覆盖不了 1.2 m 长的桌子 ✗
+#   （实测：观察位处桌子两端 x=2.10/3.30 落在视野外；而罐子在 1.14 m 只有 29×45 像素、
+#     检测器完全认不出 ✗）→ 走到离桌心 ~0.68 m 后原地转几个角度，每个角度拍一次，
+#   再把结果按 map 坐标合并（同一物体去重）✓
+SURVEY_YAWS = (-0.44, 0.0, 0.44)     # rad，±25°；转完并集覆盖约 ±56° ✓
+SURVEY_MERGE_DIST = 0.08             # m，map 坐标相距 < 8 cm 视为同一个物体 ✓
 CLOSE_MIN_CONFIDENCE = 0.25 # 近看这一趟放宽到这里（配合适配层的尺寸核对防误检）
 
 # 臂基座（fr3_link0）在 base_footprint 下的 x 偏移（实测）。只用来看够不够得着。
@@ -995,6 +1001,83 @@ class GraspPhase:
             if moved:
                 self.sleep(0.5)                # 等底盘停稳再量/再抓
 
+    def _rotate_by(self, dyaw, tol=0.03, timeout=8.0):
+        """原地转过 dyaw（弧度，正=左转）；用 TF 的 map 偏航闭环，不 spin ✓"""
+        if abs(dyaw) < 1e-3:
+            return True
+        rp0 = self._robot_map_pose()
+        if rp0 is None:
+            return False
+        target_yaw = rp0[2] + dyaw
+        deadline = time.time() + timeout
+        while rclpy.ok() and time.time() < deadline:
+            rp = self._robot_map_pose()
+            if rp is None:
+                break
+            err = self._normalize_angle(target_yaw - rp[2])
+            if abs(err) < tol:
+                break
+            self._publish_cmd_vel(0.0, clamp(1.2 * err, -CREEP_W_MAX, CREEP_W_MAX))
+            self.sleep(CREEP_DT)
+        for _ in range(3):
+            self._publish_cmd_vel(0.0, 0.0)
+            self.sleep(0.2)
+        rp = self._robot_map_pose()
+        return rp is not None and abs(self._normalize_angle(target_yaw - rp[2])) < 0.08
+
+    def survey_targets(self, yaws=SURVEY_YAWS):
+        """在当前站位【转几个角度】各检测一次，按 map 坐标合并去重 ✓
+
+        为什么要它（实测）：观察位离桌心 1.15 m 时，水平视野 31°（半角）覆盖不到桌子两端 ✗；
+        而小物体（番茄罐 66×101 mm）在 1 m 外只有 ~30 像素、检测器直接认不出 ✗
+        → 走到近看位（离桌心 0.68 m）再转 ±25° 扫三遍，并集覆盖 ±56°、物体 0.6~0.8 m ✓
+        合并规则：同类且 map 坐标相距 < SURVEY_MERGE_DIST ⇒ 同一个物体，保留置信度高的那次 ✓
+        返回：换算到**当前**底盘系的 GraspTargetStamped 列表（可直接喂给 choose_target）✓
+        """
+        best = {}       # (class, 约化后的 map 位置) → (conf, map_xy, class)
+        rp_od = self._robot_odom_pose()
+        for i, dyaw in enumerate(yaws):
+            if i > 0:
+                ok = self._rotate_by(dyaw - yaws[i - 1])
+                self.log.info("  扫视: 转到 {:+.0f}°{}".format(math.degrees(dyaw),
+                                                              "" if ok else "（没转到位，继续）"))
+            rp_od = self._robot_odom_pose() or rp_od
+            if rp_od is None:
+                break
+            tg = self.fetch_targets()
+            self.log.info("  扫视[{}/{}] {:+.0f}°: {} 个目标".format(
+                i + 1, len(yaws), math.degrees(dyaw), len(tg)))
+            for t in tg:
+                q = self._to_map((t.point.x, t.point.y), rp_od)
+                key = None
+                for k, (conf_k, xy_k, cls_k) in best.items():
+                    if cls_k == t.class_id and math.hypot(q[0] - xy_k[0], q[1] - xy_k[1]) < SURVEY_MERGE_DIST:
+                        key = k
+                        break
+                if key is None:
+                    best[(t.class_id, round(q[0], 2), round(q[1], 2))] = (
+                        float(t.confidence), q, t.class_id)
+                    self.log.info("    + {} conf={:.2f} map({:+.3f},{:+.3f})".format(
+                        t.class_id, t.confidence, q[0], q[1]))
+                elif float(t.confidence) > best[key][0]:
+                    cc, _, cl = best[key]
+                    best[key] = (float(t.confidence), q, cl)
+                    self.log.info("    ↑ {} 更新为 conf={:.2f}".format(t.class_id, t.confidence))
+        # 转回原朝向（对齐前先归位，免得站位解算用到歪掉的朝向）
+        if self._rotate_by(-yaws[-1]) is False:
+            self.log.warn("  扫视: 转回原朝向失败（继续）")
+        rp_od = self._robot_odom_pose() or rp_od
+        out = []
+        for _conf, q, cls in best.values():
+            xy = self._to_base(q, rp_od) if rp_od else None
+            if xy is None:
+                continue
+            t = self._mk_target(cls, _conf, xy)
+            out.append(t)
+        out.sort(key=lambda t: -t.confidence)
+        self.log.info("  扫视合并后: {} 个（去重前 {}）".format(len(out), len(best)))
+        return out
+
     def _fresh_target(self, class_id, match_radius=0.35):
         """在【抓取点上】重新量一次目标 → (target, obstacles, source)。
 
@@ -1220,9 +1303,10 @@ class GraspPhase:
                         self.align_and_approach((TABLE_CENTER_XYZ[0], TABLE_CENTER_XYZ[1]),
                                                 stand_dist=CLOSE_LOOK_DIST, timeout=15.0)
                         self.sleep(0.5)
-                        targets = self.fetch_targets()
+                        self.log.info("近看位扫视（转 {} 个角度，单视场覆盖不到整桌 ✓）"
+                                      .format(len(SURVEY_YAWS)))
+                        targets = self.survey_targets()
                         self.last_targets = targets
-                        self.log.info("近看返回 {} 个目标".format(len(targets)))
             if not targets:
                 self.log.error("视觉没给出任何目标（观察位 + 近看位都没有）→ 结束抓取阶段（不会退真值 ✗）")
                 return False
@@ -1253,7 +1337,8 @@ class GraspPhase:
                     prev = self.min_confidence
                     self.min_confidence = CLOSE_MIN_CONFIDENCE
                     try:
-                        targets = self.fetch_targets()
+                        self.log.info("近看位扫视（转 {} 个角度）".format(len(SURVEY_YAWS)))
+                        targets = self.survey_targets()
                         self.last_targets = targets
                         self.log.info("近看候选 {} 个：{}".format(
                             len(targets),
