@@ -911,9 +911,9 @@ class GraspPhase:
         """
         tr = self._track.get(class_id)
         if tr is not None and (time.time() - tr[0]) <= refresh_after:
-            rp_od = self._robot_odom_pose()
-            if rp_od is not None:
-                xy = self._to_base(tr[1], rp_od)
+            rp_map = self._robot_map_pose()      # ★ 必须用 map 位姿（见下）
+            if rp_map is not None:
+                xy = self._to_base(tr[1], rp_map)
                 self.log.info("  （用里程计跟踪 {}：odom{} → base({:+.3f},{:+.3f})）"
                               .format(class_id, tuple(round(v, 3) for v in tr[1]), xy[0], xy[1]))
                 return xy
@@ -933,11 +933,11 @@ class GraspPhase:
         #   只要够近（0.25 m）就认它是同一个物体 ✓ 标签原样打日志，不偷偷改类别。
         tr = self._track.get(class_id)
         if tr is not None and tg:
-            rp_od = self._robot_odom_pose()
-            if rp_od is not None:
+            rp_map = self._robot_map_pose()      # ★ 修正：原来喂 odom 位姿 ⇒ map 位置整体偏移
+            if rp_map is not None:
                 best, best_d = None, 0.25
                 for t in tg:
-                    q = self._to_map((t.point.x, t.point.y), rp_od)
+                    q = self._to_map((t.point.x, t.point.y), rp_map)
                     d = math.hypot(q[0] - tr[1][0], q[1] - tr[1][1])
                     if d < best_d:
                         best, best_d = t, d
@@ -951,10 +951,10 @@ class GraspPhase:
 
     def _remember(self, class_id, tgt):
         """把某类别的当前位置记成 odom 坐标（creep 的跟踪基准）。"""
-        rp_od = self._robot_odom_pose()
-        if rp_od is None:
+        rp_map = self._robot_map_pose()          # ★ 同上：轨迹存 map 坐标，就得用 map 位姿
+        if rp_map is None:
             return
-        self._track[class_id] = (time.time(), self._to_map((tgt.point.x, tgt.point.y), rp_od))
+        self._track[class_id] = (time.time(), self._to_map((tgt.point.x, tgt.point.y), rp_map))
 
     def _publish_cmd_vel(self, v, w):
         m = Twist()
