@@ -1056,13 +1056,13 @@ class GraspPhase:
         返回：换算到**当前**底盘系的 GraspTargetStamped 列表（可直接喂给 choose_target）✓
         """
         best = {}       # (class, 约化后的 map 位置) → (conf, map_xy, class)
-        rp_od = self._robot_odom_pose()
+        rp_od = self._robot_map_pose()       # ★ 下面算的是 map 坐标 ⇒ 必须用 map 位姿
         for i, dyaw in enumerate(yaws):
             if i > 0:
                 ok = self._rotate_by(dyaw - yaws[i - 1])
                 self.log.info("  扫视: 转到 {:+.0f}°{}".format(math.degrees(dyaw),
                                                               "" if ok else "（没转到位，继续）"))
-            rp_od = self._robot_odom_pose() or rp_od
+            rp_od = self._robot_map_pose() or rp_od
             if rp_od is None:
                 break
             tg = self.fetch_targets()
@@ -1087,7 +1087,7 @@ class GraspPhase:
         # 转回原朝向（对齐前先归位，免得站位解算用到歪掉的朝向）
         if self._rotate_by(-yaws[-1]) is False:
             self.log.warn("  扫视: 转回原朝向失败（继续）")
-        rp_od = self._robot_odom_pose() or rp_od
+        rp_od = self._robot_map_pose() or rp_od     # ★ 同上：q 是 map 坐标，回换算也要 map 位姿
         out = []
         for _conf, q, cls in best.values():
             xy = self._to_base(q, rp_od) if rp_od else None
@@ -1121,7 +1121,7 @@ class GraspPhase:
         # ★ 同名但位置离谱的检测不要（远处同类别物体 / 误检）：与上次跟踪位置比一比，
         #   超过 match_radius 就当成"不是同一个物体"（爬行期间物体不可能移动 35 cm）
         if same and tr is not None:
-            rp_od = self._robot_odom_pose()
+            rp_od = self._robot_map_pose()       # ★ 修正：tr[1] 是 map 坐标，原来喂 odom ⇒ 比错
             if rp_od is not None:
                 near = []
                 for t in same:
@@ -1133,7 +1133,7 @@ class GraspPhase:
                                   .format(class_id, match_radius))
                 same = near
         if not same and tr is not None:
-            rp_od = self._robot_odom_pose()
+            rp_od = self._robot_map_pose()       # ★ 同上：与 tr[1]（map 坐标）比距离
             if rp_od is not None:
                 best, bd = None, match_radius
                 for t in tg:
@@ -1426,8 +1426,9 @@ class GraspPhase:
             #   观察位量到的 base 系点到了站位就是错的 ✗
             #   （实测：站位上视觉没认出 sugar_box → 沿用了观察位那次 base(1.184,0.249)
             #    的相对量 → 手被指到 1.18 m 外，根本不是物体在的地方）
-            # 用 odom 记账（不是 map ✗）：见 _robot_odom_pose 的说明
-            rp_od = self._robot_odom_pose() or rp
+            # 用 map 记账（不是 odom ✗）：_track/_final_map 全程存 map 坐标
+            #   （见 _remember / measure），这里用 odom 会让后面 _to_base 换算错一个 AMCL 偏移
+            rp_od = self._robot_map_pose() or rp
             self._track[target.class_id] = (time.time(),
                                             self._to_map((target.point.x, target.point.y), rp_od))
             self._final_map = {"class": target.class_id, "conf": target.confidence,
@@ -1509,7 +1510,9 @@ class GraspPhase:
                 # 抓取点上认不出来 → 退回"观察位估计 + 里程计外推"，并明确告警
                 self.log.warn("抓取点上认不出 {} → 退回观察位估计 + 里程计外推（精度差，可能碰物体）"
                               .format(target.class_id))
-                rp2 = self._robot_odom_pose() or self._robot_map_pose()
+                # ★ fm["xy"] 是 map 坐标（_final_map / _track 的基准）⇒ 必须用 map 位姿换算；
+                #   原来优先用 odom 位姿 ⇒ 会整体错一个 AMCL 偏移（宁可拿不到位姿就报错退出）
+                rp2 = self._robot_map_pose()
                 if rp2 is None:
                     self.log.error("拿不到任何底盘位姿，没法把目标换算到当前底盘系")
                     return False
