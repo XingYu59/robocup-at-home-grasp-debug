@@ -216,7 +216,7 @@ class DetectGraspTargetNode(Node):
         #     · 偏置扫描里"比契约点浅 40 mm"时手指已经碰到罐子 ⇒ 真值比报的近 ≥40 mm
         #   本参数把契约点沿【视线】朝相机方向平移（负值 = 拉近），默认 -0.045 m。
         #   设为 0.0 即回到未补偿行为 ✓
-        self.declare_parameter("contract_range_offset", -0.045)
+        self.declare_parameter("contract_range_offset", -0.022)   # 二分：0=太深✗、-0.045=太浅✗ ⇒ 取中点
         self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
         self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
         self.declare_parameter("map_frame", "map")
