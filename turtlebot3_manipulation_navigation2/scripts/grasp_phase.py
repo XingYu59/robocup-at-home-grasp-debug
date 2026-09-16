@@ -149,6 +149,143 @@ REACH_MIN, REACH_MAX = 0.10, 0.75
 MAX_TARGET_TRIES = 2            # 抓失败换目标的次数（规则书：四个里任选一个）
 
 
+# ═══════════════════════════════════════════════════════════════
+# ★ 合拢时刻判定（纯函数，离线单测：HANDOFF_harness/test_closure_phase.py）
+# ═══════════════════════════════════════════════════════════════
+# 为什么加这一行日志（2026-09-15 现场）：
+#   日志里 `指尖轨迹` 报"本次最远 x 0.400"，`落点核对` 同时报"距契约点 0 mm" ——
+#   这两条**并不矛盾**：落点核对只取【轨迹里最接近契约点的那一次采样】，
+#   那可能只是路过的一瞬间 ✗（所以 0 mm 不能证明"夹爪停在了契约点"）
+#   能真正区分"空合"与"正常抓取"的只有一个量：**两指开始合拢那一刻，指尖 x 在哪**
+#     · 那一刻 x≈0.400（比契约点深 34 mm）⇒ 指腹已在罐子背面之后 ⇒ 空合 ✓ 自洽
+#     · 那一刻 x≈0.366，而 0.400 出现在抬升/放回段 ⇒ 这条线索作废 ✗
+#   判定只用【时间戳 + 间距序列】，不猜：
+#     合拢开始 = 间距自张开值起累计减小 > CLOSE_DROP_MM
+#     合拢结束 = 间距连续 STILL_HOLD_S 内变化 < STILL_TOL_MM
+#     阶段归属 = "最大 x 那次采样"的序号 vs 合拢开始/结束的序号（时间序，不用 z 猜）
+CLOSE_DROP_MM = 2.0     # mm，间距累计减小超过它 ⇒ 认定"开始合拢"
+STILL_TOL_MM = 0.2      # mm，间距变化小于它 ⇒ 视为"手指不动"
+STILL_HOLD_S = 0.5      # s，连续不动这么久 ⇒ 认定"合拢结束"
+
+
+def analyze_closure(samples, close_drop_mm=CLOSE_DROP_MM,
+                    still_tol_mm=STILL_TOL_MM, still_hold_s=STILL_HOLD_S):
+    """判定"合拢开始/结束"时刻，并把"最大 x"归到 接近/合拢/之后 哪一段。
+
+    samples = [(t, x, y, z, gap_mm), ...]，按时间升序；gap_mm 允许是 None
+    （那一次 TF 没查到）。x/y/z = fr3_hand_tcp 在 base_footprint 里的位置。
+    返回 dict；样本太少、或本次调用里根本没有合拢动作时返回 None（不硬凑结论 ✗）。
+    """
+    if len(samples) < 3:
+        return None
+    # ── 合拢开始：张开值取"到目前见过的最大间距"（容忍噪声上跳，不要求严格单调 ✓）
+    #    并要求【连续两帧】都过阈值：单帧 TF 抖动跳一下不算合拢（这条日志就是用来
+    #    定"合拢那一刻指尖在哪"的，误触发会把结论带偏 ✗）；记录的仍是第一帧过阈值的
+    #    那一帧，只是等下一帧确认它没弹回去 ✓
+    i_start, i_pend, ref_gap = None, None, None
+    for i, s in enumerate(samples):
+        g = s[4]
+        if g is None:
+            continue
+        ref_gap = g if ref_gap is None else max(ref_gap, g)
+        if ref_gap - g <= close_drop_mm:
+            i_pend = None                    # 弹回张开值附近 ⇒ 上一次过阈值是抖动
+            continue
+        if i_pend is None:
+            i_pend = i
+            continue
+        i_start = i_pend
+        break
+    if i_start is None:
+        return None                       # 间距从没（连续两帧）累计减小 > 2 mm ⇒ 没合拢
+    # ── 合拢结束：自开始起，间距连续 still_hold_s 内变化 < still_tol_mm
+    i_end, end_estimated = None, False
+    t_ref, g_ref, i_move = samples[i_start][0], samples[i_start][4], i_start
+    for i in range(i_start + 1, len(samples)):
+        t, g = samples[i][0], samples[i][4]
+        if g is None:
+            continue
+        if abs(g - g_ref) >= still_tol_mm:
+            t_ref, g_ref, i_move = t, g, i
+        elif t - t_ref >= still_hold_s:
+            i_end = i
+            break
+    if i_end is None:
+        # 兜底：整个调用里没满足静止判据（TF 抖动 / 服务在判据满足前就返回）→
+        # 用"最后一次间距明显变化"的时刻当结束，并在日志里标【估计】，不静默当成精确值 ✗
+        i_end, end_estimated = i_move, True
+    # ── 汇总
+    #    ★ 合拢触发帧必然会滞后：2 mm 阈值 + 10 Hz 采样，间距关得快时一帧就差几 mm
+    #     （间距 29 mm/s ⇒ 一帧 2.9 mm）⇒ 把"触发前一帧"也带上，
+    #      这样"合拢刚启动时指尖在哪"就是 [前一帧 x, 触发帧 x] 这个区间，不含糊 ✓
+    i_pre = next((i for i in range(i_start - 1, -1, -1) if samples[i][4] is not None),
+                 i_start)
+    gaps = [s[4] for s in samples[:i_end + 1] if s[4] is not None]
+    gap_end = next((samples[i][4] for i in range(i_end, -1, -1)
+                    if samples[i][4] is not None), None)
+    xs_close = [samples[i][1] for i in range(i_start, i_end + 1)]
+    i_maxx = max(range(len(samples)), key=lambda k: samples[k][1])
+    t0 = samples[0][0]
+    return {
+        "i_start": i_start, "i_end": i_end, "end_estimated": end_estimated,
+        "t_start": samples[i_start][0] - t0, "t_end": samples[i_end][0] - t0,
+        "xyz_start": samples[i_start][1:4], "xyz_end": samples[i_end][1:4],
+        "xyz_pre": samples[i_pre][1:4], "t_pre": samples[i_pre][0] - t0,
+        "gap_pre": samples[i_pre][4],
+        "gap_open": max(gaps) if gaps else None, "gap_end": gap_end,
+        "x_close_min": min(xs_close), "x_close_max": max(xs_close),
+        "x_max": samples[i_maxx][1], "z_at_maxx": samples[i_maxx][3],
+        "t_maxx": samples[i_maxx][0] - t0,
+        "phase": ("after" if i_maxx > i_end else
+                  "during" if i_maxx >= i_start else "before"),
+        "n": len(samples), "n_gap": sum(1 for s in samples if s[4] is not None),
+    }
+
+
+def format_closure_report(f, tgt_x, tgt_y):
+    """把 analyze_closure 的结果排成可直接粘贴的日志行（列表，1~2 行，纯字符串）。"""
+    if f is None:
+        return ["  ★ 合拢时刻: 没采到足够的间距/指尖样本（或本次调用里没有合拢动作）"
+                "→ 无法判定 ✗"]
+    x0, y0, z0 = f["xyz_start"]
+    xe, ye, ze = f["xyz_end"]
+    dx, dy = (x0 - tgt_x) * 1000.0, (y0 - tgt_y) * 1000.0
+    dxe, dye = (xe - tgt_x) * 1000.0, (ye - tgt_y) * 1000.0
+    line = ("  ★ 合拢时刻: 指尖 base({:+.3f},{:+.3f},{:.3f}) 距契约点"
+            " (Δx={:+.0f} mm, Δy={:+.0f} mm) | 合拢前 {} → 结束 {} | "
+            "合拢期间 x 范围 [{:.3f}, {:.3f}]".format(
+                x0, y0, z0, dx, dy,
+                "?" if f["gap_open"] is None else "{:.1f} mm".format(f["gap_open"]),
+                "?" if f["gap_end"] is None else "{:.1f} mm".format(f["gap_end"]),
+                f["x_close_min"], f["x_close_max"]))
+    # ── 阶段归属：最大 x 落在【合拢之前/期间/结束之后】哪一段（按采样序号=时间序）
+    xm, ts, te, tm = f["x_max"], f["t_start"], f["t_end"], f["t_maxx"]
+    dm = (xm - tgt_x) * 1000.0
+    if f["phase"] == "during":
+        line += ("（本次最大 x {:.3f} 出现在合拢【期间】（t=+{:.1f} s，开始 t=+{:.1f} s / "
+                 "结束 t=+{:.1f} s）✗ ⇒ Δx={:+.0f} mm 的深偏置确实发生在合拢时刻，"
+                 "不是路过）".format(xm, tm, ts, te, dm))
+    elif f["phase"] == "after":
+        line += ("（本次最大 x {:.3f} 出现在合拢结束【之后】（t=+{:.1f} s > 结束 t=+{:.1f} s；"
+                 "z {:.3f}→{:.3f}{}）⇒ 属抬升/放回，与抓取无关）".format(
+                     xm, tm, te, z0, f["z_at_maxx"],
+                     " 在上升" if f["z_at_maxx"] > z0 else " 未上升"))
+    else:
+        line += ("（本次最大 x {:.3f} 出现在合拢【之前】（接近段，t=+{:.1f} s < 开始 t=+{:.1f} s）"
+                 "⇒ 与合拢时刻无关，合拢时刻看本行前面的 x）".format(xm, tm, ts))
+    return [line,
+            "  合拢结束: 指尖 base({:+.3f},{:+.3f},{:.3f}) 距契约点 (Δx={:+.0f} mm, Δy={:+.0f} mm)"
+            "｜合拢前最后一帧 x={:+.3f}（{} mm, t=+{:.1f} s）→ 触发帧 x={:+.3f}"
+            "（2 mm 阈值滞后 1 帧 ⇒ 合拢刚启动时的 x 在这两者之间）"
+            "｜合拢段 {:.1f} s、采样 {} 次（间距有效 {} 次）{}".format(
+                xe, ye, ze, dxe, dye,
+                f["xyz_pre"][0],
+                "?" if f["gap_pre"] is None else "{:.1f}".format(f["gap_pre"]),
+                f["t_pre"], x0, te - ts, f["n"], f["n_gap"],
+                "（⚠ 结束时刻为估计值：没满足 {:.1f} s 静止判据）".format(STILL_HOLD_S)
+                if f["end_estimated"] else "")]
+
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -1237,6 +1374,12 @@ class GraspPhase:
         #   home 位姿的指尖 z(0.914) 比抓取位姿(0.9195) 还低 → 只留最小 z 会永远
         #   记成 home 位姿（实测踩过，害我误判"机械臂没到位" ✗）
         tcp_xs, tcp_ys, tcp_zs = [], [], []
+        # ★ 合拢时刻判定（2026-09-15 现场）：原来时间戳/指尖 xyz/间距是分开的几组列表，
+        #   判"合拢那一刻指尖在哪"必须三者【对齐】⇒ 另存一份 (t, x, y, z, gap_mm) 的对齐样本
+        #   （见 analyze_closure / format_closure_report）。上面三组列表保持原样不动，
+        #   免得动到"指尖轨迹/落点核对"那些已经在用的逻辑 ✗。
+        #   时间用 monotonic：这里只做区间相减，不受系统时钟跳变影响 ✓
+        samples = []
         d_best, ax_best = None, None
         if gap0 is not None:
             self.log.info("  合爪前两指真实间距 = {:.1f} mm；指尖平面 base({:+.3f},{:+.3f},{:.3f})"
@@ -1260,11 +1403,17 @@ class GraspPhase:
                 tcp_xs.append(tp[0])
                 tcp_ys.append(tp[1])
                 tcp_zs.append(tp[2])
+                samples.append((time.monotonic(), tp[0], tp[1], tp[2], g))
                 d_now = math.hypot(tp[0] - target.point.x, tp[1] - target.point.y)
                 if d_best is None or d_now < d_best:      # 最接近契约点那次的姿态
                     d_best = d_now
                     ax_best = self.tcp_axes_base()
             time.sleep(0.1)
+        # ★ 合拢时刻日志：放在超时判断【之前】—— 就算这次调用超时/失败，
+        #   "两指开始合拢那一刻指尖在哪"也照样要落盘（这条正是判别空合的关键 ✓）
+        for ln in format_closure_report(analyze_closure(samples),
+                                        target.point.x, target.point.y):
+            self.log.info(ln)
         if not fut.done():
             self.log.error("抓取服务超时（>{:.0f}s）".format(GRASP_SERVICE_TIMEOUT))
             return 0, -1, "timeout"
