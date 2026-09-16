@@ -203,9 +203,13 @@ class DetectGraspTargetNode(Node):
         #     contract_axis_pct: 50.0 就退化成改动前的行为 ✓）
         #     轴向 = 相机 z 轴 = 视线方向：可见表面在深度上是"从近端轮廓拖到切点"
         #     的一段，取 20~25% 分位 = 更靠前的那个统计量 ✓
-        self.declare_parameter("contract_axis_pct", 22.0)
+        # ★ 2026-09-16：轴向可见面改用【最近面】而不是分位数 —— 圆柱的可见最近点
+        #   恰好就在轴心前方一个半径处 ⇒ 轴心 = 最近面 + 1.0×r 是【几何精确】的 ✓
+        #   （现场观察：夹爪中心比罐子中心更靠里；根因是相机比罐顶低 ⇒ 掩码含罐口边缘
+        #     像素、其深度≈轴心深度 ⇒ 把 22% 分位这种软统计量往深里拉 ✗）
+        self.declare_parameter("contract_axis_pct", 5.0)
         #     后退量系数：契约点 = 可见面 + 沿水平视线后退 系数·min(d,w)/2
-        self.declare_parameter("backoff_scale", 0.85)
+        self.declare_parameter("backoff_scale", 1.0)
         self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
         self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
         self.declare_parameter("map_frame", "map")
