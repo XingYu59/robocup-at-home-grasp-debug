@@ -705,6 +705,32 @@ class GraspPhase:
         """
         return self._lookup_pose("odom")
 
+    def _wait_map_pose_stable(self, timeout=30.0):
+        """等 map←base_footprint 稳定后再用：最多等 timeout s，每 0.5 s 试一次，
+        **连续两次成功且两次位置差 < 0.02 m** 才算稳定可用；超时返回 None。
+
+        ★ 为什么要有它（实测）：启动后约 5 s 就查 TF 会撞上 AMCL 的竞态
+          （initialpose 刚发、AMCL 还在收敛）⇒ map←base_footprint 取不到、或取到还在跳的
+          值 ⇒ 原来"拿不到就直接失败"会让【整轮抓取】白跑 ✗
+          稳定之前不信任任何 map 换算（观察位/站位都是从它算出来的）✓
+        ★ 代价：成功路径多花一个 0.5 s 采样间隔（必须隔开才有"连续两次"可比），
+          稳定后立刻返回，不多等 ✓
+        """
+        deadline = time.time() + timeout
+        prev = None
+        while True:
+            rp = self._robot_map_pose()        # 第一次一定查（与原逻辑一致，不受 rclpy 状态影响）
+            if rp is not None:
+                if prev is not None and math.hypot(rp[0] - prev[0], rp[1] - prev[1]) < 0.02:
+                    return rp
+                prev = rp
+            if not rclpy.ok() or time.time() >= deadline:
+                break
+            self.sleep(0.5)
+        self.log.error("  map←base_footprint 等了 {:.0f} s 仍不稳定/取不到（AMCL 未收敛？）"
+                       .format(timeout))
+        return None
+
     def _lookup_pose(self, parent_frame):
         if self.tf_buffer is None:
             return None
@@ -1331,7 +1357,10 @@ class GraspPhase:
         self.log.info("Phase 2 抓取阶段开始（只用视觉；不读 gz 真值 ✗）")
 
         if not skip_nav:
-            rp0 = self._robot_map_pose()
+            # ★ 算观察位前等 map←base_footprint 稳定（启动时 AMCL 竞态，见 _wait_map_pose_stable）；
+            #   命令行直接给了 observation_pose 时不需要它（rp0 只用于日志/法线兜底）⇒ 保持单次查询
+            rp0 = (self._wait_map_pose_stable() if observation_pose is None
+                   else self._robot_map_pose())
             if observation_pose is None:
                 if rp0 is None:
                     self.log.error("拿不到 map←base_footprint，算不出观察位")
@@ -1383,7 +1412,8 @@ class GraspPhase:
                 len(targets),
                 ["{}({:.2f})".format(t.class_id, t.confidence) for t in targets]))
             # 选目标前先拿机器人的 map 位姿：①支撑面校验 ②站位解算 都要用
-            rp = self._robot_map_pose()
+            # ★ 算站位前等它稳定（启动/重定位时 AMCL 会让它跳，见 _wait_map_pose_stable）
+            rp = self._wait_map_pose_stable()
             if rp is None:
                 self.log.error("拿不到 map←base_footprint 变换，算不出站位")
                 return False
