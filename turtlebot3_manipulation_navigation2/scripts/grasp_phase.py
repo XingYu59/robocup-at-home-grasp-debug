@@ -45,6 +45,14 @@ from nav2_msgs.action import NavigateToPose
 from turtlebot3_manipulation_grasp.msg import GraspTargetStamped
 from turtlebot3_manipulation_grasp.srv import DetectGraspTarget, GraspFixedObject
 
+# ★ 2026-09-16：支撑面门改成【只提示不拦截】
+#   实测 map 侧位姿在扫视/导航期间会偏移 0.5 m 以上（同一罐子两次 map 位置差 0.54 m）
+#   ⇒ 这道门会误杀真目标 → 整段抓取放弃 ✗。抓取本身走 base 系（可靠 ✓）；
+#   "车开上桌子"的真正防线是站位的 nav-map 自由空间校验（仍强制 ✓）。
+#   想恢复严格拦截：把下面改成 True
+SUPPORT_GATE_ENFORCE = False
+
+
 # ═══════════════════════════════════════════════════════════════
 # 固定场景常量（map 帧 = Gazebo world 帧）
 # ═══════════════════════════════════════════════════════════════
