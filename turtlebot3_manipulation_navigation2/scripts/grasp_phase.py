@@ -737,6 +737,8 @@ class GraspPhase:
           东端 chips_can 在 (1.9, 2.0)，|dx| = 0.8 正好落进 0.6+0.20 的窗里 ✗）
           → 再显式排掉【邻居餐桌自己的脚印】里的点 ✓
         """
+        if not SUPPORT_GATE_ENFORCE:              # 只提示不拦截（原因见上面的常量说明）
+            return True
         if TABLE_IS_DINING:                       # 只在餐厅那三张并排桌子时启用 ✓
             for cx, cy in NEIGHBOR_TABLES:        # 邻居桌子脚印内 → 不是本桌的目标
                 if (abs(p_map[0] - cx) <= NEIGHBOR_HALF[0] - 0.05
