@@ -198,6 +198,14 @@ class DetectGraspTargetNode(Node):
         self.declare_parameter("position_source", "auto")   # auto | plane | mask
         self.declare_parameter("mask_erode_px", 2)
         self.declare_parameter("plane_min_den", 0.10)       # 平面约束条件数下限
+        #  ④ 契约点前移（2026-09-16）：只作用于 _contract_point（= 抓取路径），
+        #     与 ① ② ③ 一样可以单独关掉做 A/B（backoff_scale: 1.0 且
+        #     contract_axis_pct: 50.0 就退化成改动前的行为 ✓）
+        #     轴向 = 相机 z 轴 = 视线方向：可见表面在深度上是"从近端轮廓拖到切点"
+        #     的一段，取 20~25% 分位 = 更靠前的那个统计量 ✓
+        self.declare_parameter("contract_axis_pct", 22.0)
+        #     后退量系数：契约点 = 可见面 + 沿水平视线后退 系数·min(d,w)/2
+        self.declare_parameter("backoff_scale", 0.85)
         self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
         self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
         self.declare_parameter("map_frame", "map")
@@ -228,6 +236,9 @@ class DetectGraspTargetNode(Node):
         self.position_source = str(p("position_source") or "auto").lower()
         self.mask_erode_px = max(0, int(p("mask_erode_px")))
         self.plane_min_den = float(p("plane_min_den"))
+        # ④ 契约点前移：轴向（视线方向）分位数 + 后退量系数（见 declare 处的说明）
+        self.contract_axis_pct = min(50.0, max(0.0, float(p("contract_axis_pct"))))
+        self.backoff_scale = max(0.0, float(p("backoff_scale")))
         self.yaw_backoff = bool(p("yaw_backoff"))
         self.table_check = bool(p("table_check"))
         self.map_frame = str(p("map_frame") or "map")
@@ -905,6 +916,12 @@ class DetectGraspTargetNode(Node):
         · 相机与桌面等高 → 穿过物体中心的视线是水平的，**不能**用"视线∩支撑面"；
           改成：质心 + 沿【水平视线方向】后退 半个物体厚度（可见面本来就近半个厚度）
         · z 直接取支撑面高度 ✓（契约定义）
+
+        ★ 补丁④（2026-09-16）把点整体往回（靠相机一侧）拉几毫米，两处一起改：
+          ① 轴向（相机 z = 视线方向）取 contract_axis_pct 分位，横向仍用中位数；
+          ② 后退量乘 backoff_scale。
+          只在本函数里生效 ⇒ 只在抓取路径（唯一的调用点是 handle_detect 的契约点那段）；
+          队友的识别/计数路径不经过这里，也不碰 _mask_points_cam 的 patch=False 分支 ✓
         """
         q = tf.transform.rotation
         t = tf.transform.translation
@@ -921,10 +938,19 @@ class DetectGraspTargetNode(Node):
         #     距离也被报远 5~10 cm）→ 机械臂伸手过头、手指落到物体后面 → 夹空 ✗
         #   中位数对少量/一侧的污染免疫 ✓
         p_cam = np.median(pts_cam, axis=0)
+        # ★ 补丁④-①：轴向换成 20~25% 分位（更靠前），横向仍用中位数。
+        #   为什么轴向要更靠前：可见表面在深度方向是"从近端轮廓拖到切点"的一段，
+        #   中位数落在中段；相机只高出桌面 ~39 mm、几乎平视时，中段偏后就整体
+        #   表现为"契约点落进桌子里面" ✗。分位越低越靠前，而且对"掩码吃进更远的
+        #   桌面像素"免疫（与 _mask_points_cam 的距离闸门同向）✓
+        z_med = float(p_cam[2])
+        z_axis = float(np.percentile(pts_cam[:, 2], self.contract_axis_pct))
+        p_cam = np.array([p_cam[0], p_cam[1], z_axis])
         z10, z90 = np.percentile(pts_cam[:, 2], [10, 90])
         if z90 - z10 > 0.06:
             self.get_logger().warn("  掩码深度跨度偏大（10%~90%: {:.3f}~{:.3f} m，"
-                                   "跨度 {:.0f} mm）→ 多半吃进了桌面，位置已用中位数抑制 ✓"
+                                   "跨度 {:.0f} mm）→ 多半吃进了桌面，位置已用"
+                                   "横向中位数/轴向低分位抑制 ✓"
                                    .format(z10, z90, (z90 - z10) * 1000))
         p_tgt = R.dot(p_cam) + np.array([t.x, t.y, t.z])
 
@@ -942,10 +968,18 @@ class DetectGraspTargetNode(Node):
             d, w, h = self.object_sizes[cls]
             depth = min(x for x in (d, w) if x > 0)      # 可见面比轴心近"窄边/2"
         back = (depth / 2.0) if depth else 0.0
+        # ★ 补丁④-②：后退量打折（默认 0.85）—— 契约点再往相机一侧挪几毫米 ✓
+        back_scaled = back * self.backoff_scale
+        # 现场核对用：分位、轴向统计量的前移量、后退量前后值都打出来 ✓
+        self.get_logger().info(
+            "  契约点[{}]: 轴向 {:.0f}% 分位 {:.3f} m（比逐轴中位数 {:.3f} m 前移 {:.0f} mm）"
+            "  后退 {:.0f} → {:.0f} mm（系数 {:.2f}）".format(
+                cls, self.contract_axis_pct, z_axis, z_med, (z_med - z_axis) * 1000.0,
+                back * 1000.0, back_scaled * 1000.0, self.backoff_scale))
 
-        x = p_tgt[0] + v[0] * back
-        y = p_tgt[1] + v[1] * back
-        return np.array([x, y, self.support_z]), p_tgt, back
+        x = p_tgt[0] + v[0] * back_scaled
+        y = p_tgt[1] + v[1] * back_scaled
+        return np.array([x, y, self.support_z]), p_tgt, back_scaled
 
     # ── 服务回调 ───────────────────────────────────────────────
     def handle_detect(self, request, response):
