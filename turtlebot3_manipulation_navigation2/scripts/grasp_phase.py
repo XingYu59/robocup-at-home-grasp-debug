@@ -851,14 +851,21 @@ class GraspPhase:
         while True:
             rp = self._robot_map_pose()        # 第一次一定查（与原逻辑一致，不受 rclpy 状态影响）
             if rp is not None:
-                if prev is not None and math.hypot(rp[0] - prev[0], rp[1] - prev[1]) < 0.02:
+                if prev is not None and math.hypot(rp[0] - prev[0], rp[1] - prev[1]) < 0.05:
                     return rp
                 prev = rp
             if not rclpy.ok() or time.time() >= deadline:
                 break
             self.sleep(0.5)
-        self.log.error("  map←base_footprint 等了 {:.0f} s 仍不稳定/取不到（AMCL 未收敛？）"
-                       .format(timeout))
+        # ★ 2026-09-16 修正：原来这里 return None ⇒ 调用方直接判定整轮失败 ✗
+        #   实测 AMCL 启动阶段会连续抖动 >20 mm ⇒ 把任务卡死（"拿不到 map←base_footprint，
+        #   算不出观察位"）。**拿到过位姿就该用最新的那个**，抖动只是精度差一点，
+        #   远好于整轮放弃 ✓；只有一次都没取到才返回 None（= 原来的失败路径 ✓）
+        if prev is not None:
+            self.log.warn("  map←base_footprint 在 {:.0f} s 内没稳定（AMCL 仍在收敛？）"
+                          "→ 用最新位姿 ({:+.3f},{:+.3f}) 继续 ✓".format(timeout, prev[0], prev[1]))
+            return prev
+        self.log.error("  map←base_footprint 一次都没取到（AMCL 没起来？）".format())
         return None
 
     def _lookup_pose(self, parent_frame):
