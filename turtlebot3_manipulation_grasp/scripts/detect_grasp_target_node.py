@@ -1200,7 +1200,8 @@ class DetectGraspTargetNode(Node):
                           self._size_range_crosscheck(cls, d.get("mask"), depth, k))
                     if xc and xc.get("too_small"):
                         self.get_logger().info(
-                            "  已知尺寸测距[{}]: 掩码只有 {:.0f} px 宽（<70 px）→ 量化误差可达几厘米，结论不可用，跳过".format(
+                            "  已知尺寸测距[{}]: 掩码太窄（<70 px，本帧 {:.0f} px）"
+                            "⇒ 量化误差可达几厘米，结论不可用，跳过".format(
                                 cls, xc["w_px"]))
                     elif xc:
                         if "z_size" in xc:
