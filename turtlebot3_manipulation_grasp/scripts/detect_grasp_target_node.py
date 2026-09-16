@@ -849,7 +849,9 @@ class DetectGraspTargetNode(Node):
         zs = zs[np.isfinite(zs) & (zs > 0.0) & (zs < self.max_range)]
         if zs.size < 20:
             return None
-        if w_px < 40:                    # 太窄时 1 px 量化误差就是几厘米 ⇒ 不可用，别误导 ✗
+        # ★ 太窄时 1 px 量化误差就是几厘米（实测 42~43 px 时报出 −111/−419 mm 的假误差 ✗）
+        #   ⇒ 阈值 40→70 px：低于它结论不可用，宁可跳过也不误导 ✓
+        if w_px < 70:
             return dict(w_px=w_px, too_small=True)
         is_round = abs(d - w) < 0.01
         r_ax = 0.5 * (d + w) / 2.0 if is_round else 0.5 * min(d, w)
@@ -1198,7 +1200,7 @@ class DetectGraspTargetNode(Node):
                           self._size_range_crosscheck(cls, d.get("mask"), depth, k))
                     if xc and xc.get("too_small"):
                         self.get_logger().info(
-                            "  已知尺寸测距[{}]: 掩码只有 {:.0f} px 宽 → 量化误差太大，跳过".format(
+                            "  已知尺寸测距[{}]: 掩码只有 {:.0f} px 宽（<70 px）→ 量化误差可达几厘米，结论不可用，跳过".format(
                                 cls, xc["w_px"]))
                     elif xc:
                         if "z_size" in xc:
