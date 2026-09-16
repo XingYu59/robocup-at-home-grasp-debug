@@ -147,6 +147,9 @@ def run_case(name, cls, cam_xyz, obj_xy, obj_r=None, obj_hw=None, obj_h=0.115,
     if xc and "z_size" in xc:
         print("  已知尺寸测距: 掩码宽 {:.0f} px → 轴距 尺寸法 {:.3f} m vs 深度法 {:.3f} m "
               "→ 差 {:+.0f} mm".format(xc["w_px"], xc["z_size"], xc["z_dep"], xc["diff"] * 1000))
+    elif xc and xc.get("too_small"):
+        print("  已知尺寸测距: 掩码宽 {:.0f} px → 太窄（<70 px），脚本早退（这与真实节点行为一致 ✓）".format(
+            xc["w_px"]))
     elif xc:
         print("  已知尺寸测距: 掩码宽 {:.0f} px → 隐含宽度 {:.3f} m（目录 {:.3f}~{:.3f}）".format(
             xc["w_px"], xc["implied_d"], xc["expect_lo"], xc["expect_hi"]))
