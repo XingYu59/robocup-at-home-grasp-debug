@@ -589,9 +589,16 @@ class GraspPhase:
 
     # ══════════════ ② 选目标（硬过滤 + 档位 + 并列时排序）══════════════
     @staticmethod
-    def _on_support(p_map, margin=0.30):
+    def _on_support(p_map, margin=0.20):
         """目标是否落在支撑面（餐桌 dinning_table_3）足迹内（带容差，吸收 AMCL 误差）。
 
+        ★ margin 只吸收 AMCL 的 map↔odom【静态偏置】（实测约 0.16 m）✓，
+          **不承担掩盖错帧/过期位姿的责任** ✗：曾经把它从 0.15 放到 0.30 去"兜住"
+          一个 0.547 m 的偏移（真因是扫视前取的位姿被用到扫视之后，见 run() 的
+          "定位快照"）——那是掩盖不是修复；而且真正判否的是下面那个【没有容差】的
+          邻居桌排除分支，放宽容差根本兜不住 ✗
+          ⇒ 0.20 = 刚好吃得下 0.16 m 静态偏置；错帧要靠"位姿新鲜"（run() 里换算前
+            重取位姿）和坐标系契约（_to_map/_to_base 一律传 map 位姿）来保证 ✓
         ★ 必须有这道校验：站在观察位面朝餐桌时，相机水平视野 62°，会**同时看到左右
           两张桌子** ✗（实测：table_1 x0.9~2.1、table_2 y1.25~1.75，都在画面里，
           它们上面的物体比本桌的多）。曾经因此选中 table_2 上的东西 →
@@ -1066,6 +1073,9 @@ class GraspPhase:
             if rp_od is None:
                 break
             tg = self.fetch_targets()
+            # ★ fetch_targets 一次要 20~35 s（实测 21.5 s），上面那次位姿查询在它【之前】✗
+            #   ⇒ 换算前重取一次，别把这 20~35 s 里的 AMCL 修正丢掉（与 run()"定位快照"同因）
+            rp_od = self._robot_map_pose() or rp_od
             self.log.info("  扫视[{}/{}] {:+.0f}°: {} 个目标".format(
                 i + 1, len(yaws), math.degrees(dyaw), len(tg)))
             for t in tg:
@@ -1402,6 +1412,22 @@ class GraspPhase:
                         self.log.info("近看候选 {} 个：{}".format(
                             len(targets),
                             ["{}({:.2f})".format(t.class_id, t.confidence) for t in targets]))
+                        # ★ 扫视转了 ±25°、耗时约 35 s，而上面那个 rp 是【扫视之前】取的 ✗：
+                        #   扫视期间 AMCL 会修正位姿（实测扫视前/后 map x 差 0.547 m）
+                        #   ⇒ 用旧位姿做 map 换算，目标点会被算进【邻居餐桌】的排除区 →
+                        #     误判"不在支撑面上（餐桌）"→ 整段放弃（task2.log 实测就这么失败）
+                        #   所以换算前重取一次，之后所有 map 换算（choose_target 的
+                        #   robot_pose、下面的 obj_map）都用这个新位姿 ✓
+                        rp_now = self._robot_map_pose()
+                        if rp_now is not None:
+                            self.log.info("  定位快照: 扫视前 map({:+.3f},{:+.3f},{:+.3f})"
+                                          " → 扫视后 map({:+.3f},{:+.3f},{:+.3f})（x 漂移 {:+.1f} mm）"
+                                          .format(rp[0], rp[1], rp[2],
+                                                  rp_now[0], rp_now[1], rp_now[2],
+                                                  (rp_now[0] - rp[0]) * 1000.0))
+                            rp = rp_now
+                        else:
+                            self.log.warn("  扫视后取不到 map 位姿 → 沿用扫视前的位姿换算（目标点可能偏移）")
                         target, obstacles, reason = self.choose_target(
                             targets, exclude=tried, check_reach=False, robot_pose=rp)
                     finally:
