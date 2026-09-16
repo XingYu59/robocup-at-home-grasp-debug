@@ -210,6 +210,13 @@ class DetectGraspTargetNode(Node):
         self.declare_parameter("contract_axis_pct", 5.0)
         #     后退量系数：契约点 = 可见面 + 沿水平视线后退 系数·min(d,w)/2
         self.declare_parameter("backoff_scale", 1.0)
+        # ★ 2026-09-16：相机外参平移无法用任何现有检查验证（桌平面校验对水平平移免疫 ✗），
+        #   但实测证据一致指向"报出的 base 点偏深 30~45 mm"：
+        #     · 像素宽度独立验证相机系距离 ✓（109 px ⇒ 0.321 m vs 报 0.317 m，差 4 mm）
+        #     · 偏置扫描里"比契约点浅 40 mm"时手指已经碰到罐子 ⇒ 真值比报的近 ≥40 mm
+        #   本参数把契约点沿【视线】朝相机方向平移（负值 = 拉近），默认 -0.045 m。
+        #   设为 0.0 即回到未补偿行为 ✓
+        self.declare_parameter("contract_range_offset", -0.045)
         self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
         self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
         self.declare_parameter("map_frame", "map")
@@ -956,6 +963,10 @@ class DetectGraspTargetNode(Node):
                                    "跨度 {:.0f} mm）→ 多半吃进了桌面，位置已用"
                                    "横向中位数/轴向低分位抑制 ✓"
                                    .format(z10, z90, (z90 - z10) * 1000))
+        # ★ 沿视线拉近/推远（相机系 z = 视线方向）；默认 -0.045 见参数说明 ✓
+        zc = p_cam[2] + float(self.get_parameter("contract_range_offset").value)
+        if zc > 0.05:
+            p_cam = np.array([p_cam[0], p_cam[1], zc])
         p_tgt = R.dot(p_cam) + np.array([t.x, t.y, t.z])
 
         # 水平视线方向（从相机原点指向物体）
