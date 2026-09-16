@@ -48,6 +48,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <algorithm>
@@ -91,6 +93,16 @@ namespace {
 
 /// 桌面碰撞体 id（与 allowCollisions(object, support) 里的 support 名字必须一致）
 const std::string kTableId = "table";
+
+/// 抓取那条 ComputeIK 阶段的名字 —— 抓取姿态的体检数据（合拢轴、注释里的采样角）
+/// 都从它产生的子解里量，见 MTCTaskNode::graspClosingYaw()。
+/// ★ 必须与 createTask() 里建那个 stage 时用的名字一致（下面用同一个常量建的）
+const char* const kGraspIkStage = "grasp pose IK";
+
+/// "合拢轴正对物体主轴"的判据容差（rad）：采样步长 90° 时对齐角正好落在
+/// 0°/90°/180°/270°，实测偏差只有 1e-12 量级；取 1° 是为了容忍浮点/URDF 取整，
+/// 同时仍能把 15°/30° 那种"斜着夹"认出来 ✗
+constexpr double kAlignedTol = 1.0 * M_PI / 180.0;
 
 /// [x,y,z,r,p,y] → Isometry3d（与官方例程一致：Rx·Ry·Rz）
 Eigen::Isometry3d vectorToEigen(const std::vector<double>& v) {
@@ -216,6 +228,111 @@ public:
       sub->setTrajectory(fixed);
       return;
     }
+  }
+
+  /// 递归找 kGraspIkStage 那条子解，量两件事：
+  ///   · closing_yaw   = 【手指合拢轴】在【物体坐标系】xy 平面里的偏航（rad）
+  ///   · comment_angle = 解注释里的采样角（rad，仅用于交叉核对，可能为 NaN）
+  /// 返回 false = 这个解里量不到（接口/结构变了）⇒ 调用方退回改动前的行为。
+  ///
+  /// ★ 为什么不直接读注释里的采样角来挑解（注释确实能读到：ComputeIK 会把上游
+  ///   GenerateGraspPose 的注释原样拷过来，compute_ik.cpp:436；dumpSolution 打的
+  ///   "抓取采样角"就是它）：
+  ///   generate_grasp_pose.cpp:173-186 是这么写的 ——
+  ///       double current_angle = 0.0;
+  ///       while (...) { AngleAxisd(current_angle, rotation_axis); current_angle += delta;
+  ///                     ... trajectory.setComment(std::to_string(current_angle)); }
+  ///   也就是注释 = **用完之后的** current_angle = 真实采样角 + angle_delta ✗
+  ///   步长 90° 时"注释里的 90°"其实是【真实 0°】：照注释挑"绕接近轴转得最少"的解
+  ///   会刚好挑反（挑到多转 90° 的那个）。注释是字符串、又带这个偏移，太容易读错。
+  /// ★ 合拢轴是几何量，不受这套约定影响：解的末态就是 ComputeIK 写好的 IK 构型
+  ///   （compute_ik.cpp:451-453 把 ik_solutions 的关节角写进末态场景），做正运动学取
+  ///   fr3_hand_tcp 的 y 轴即可 —— finger_joint1/2 都是沿 hand 系 y 轴平移的棱柱关节，
+  ///   而 tcp 相对 hand 只有 z 向平移、没有旋转（franka_hand.xacro: tcp_rpy='0 0 0'）
+  ///   ⇒ TCP 的 y 轴就是手指合拢方向 ✓
+  bool graspClosingYaw(const mtc::SolutionBase& s, const geometry_msgs::msg::Quaternion& object_rot,
+                       double& closing_yaw, double& comment_angle) const {
+    if (const auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
+      for (const auto* sub : seq->solutions())
+        if (sub && graspClosingYaw(*sub, object_rot, closing_yaw, comment_angle))
+          return true;
+      return false;
+    }
+    const auto* creator = s.creator();
+    if (!creator || creator->name() != kGraspIkStage)
+      return false;
+    const auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s);
+    if (!sub || !sub->end() || !sub->end()->scene())
+      return false;
+
+    comment_angle = std::numeric_limits<double>::quiet_NaN();
+    const std::string& comment = s.comment();
+    if (!comment.empty()) {
+      char* end = nullptr;
+      const double v = std::strtod(comment.c_str(), &end);
+      if (end && *end == '\0')   // 带尾巴的（"... no IK found"）不算，当没有 ✓
+        comment_angle = v;
+    }
+
+    bool found = false;
+    const Eigen::Isometry3d tcp =
+        sub->end()->scene()->getCurrentState().getFrameTransform(hand_frame_, &found);
+    if (!found)
+      return false;
+    Eigen::Quaterniond q;
+    tf2::fromMsg(object_rot, q);
+    // 物体坐标系里的合拢方向；xy 分量就是"绕接近轴（顶抓时=物体 z）转了多少" ✓
+    const Eigen::Vector3d closing_obj = q.toRotationMatrix().transpose() * tcp.linear().col(1);
+    closing_yaw = std::atan2(closing_obj.y(), closing_obj.x());
+    return true;
+  }
+
+  /// 从可行解里挑一个执行：**先看"合拢轴是否正对物体主轴"，再比"绕接近轴转了多少"**。
+  ///
+  /// 为什么是这个次序（2026-09-16 现场：抓取前腕部无必要地转了近 90°）：
+  ///   · 采样角只绕接近轴转手 ⇒ 绕接近轴的偏航就是"多余转腕"的量。圆柱（d≈w，
+  ///     如 tomato_soup_can 0.066×0.066）各角度物理等价，被挑中的那个要转 90° 就是白转 ✗
+  ///     采样集本来就是 {0°,90°,180°,270°}（GenerateGraspPose 从 current_angle=0 起扫），
+  ///     0° 一直在候选集里 —— 它不是"没进候选集"，而是被 MTC 的代价（IK 关节距离）
+  ///     挤掉了 ⇒ 这里把"旋转量"显式加进选解偏好即可，不用改采样步长 ✓
+  ///   · 但"转得少"不能凌驾于"正对盒面"：薄盒（0.038×0.089）与薄边偏 ±30° 以内时
+  ///     投影 77 mm < 开口 80 mm，MTC 也判可行 ⇒ 只看旋转量会把 15°/30° 斜夹挑出来 ✗
+  ///     （那正是 angle_delta 从 15° 改回 90° 之前修掉的现场故障）
+  ///   ⇒ 先按"对齐"分组（|合拢轴偏离最近的 90° 整数倍| ≤ kAlignedTol），组内再比旋转量；
+  ///     同样旋转量时按 MTC 代价取便宜的（solutions() 本身按代价升序，先到先得 ✓）
+  mtc::SolutionBaseConstPtr pickSolution(const geometry_msgs::msg::Quaternion& object_rot) const {
+    const auto& solutions = task_.solutions();
+    mtc::SolutionBaseConstPtr best;
+    bool best_aligned = false;
+    double best_rot = 0.0;
+    std::size_t i = 0;
+    for (const auto& s : solutions) {
+      ++i;
+      double yaw = 0.0, cang = 0.0;
+      if (!s || !graspClosingYaw(*s, object_rot, yaw, cang)) {
+        RCLCPP_WARN(LOGGER, "  解候选 %zu/%zu: 解里找不到 \"%s\" 子解 ⇒ 量不到合拢轴，跳过",
+                    i, solutions.size(), kGraspIkStage);
+        continue;
+      }
+      const double align = std::abs(std::remainder(yaw, M_PI / 2));      // 偏离物体主轴多少
+      const double rot = std::abs(std::remainder(yaw + M_PI / 2, M_PI)); // 绕接近轴转了多少
+      const bool aligned = align <= kAlignedTol;
+      const std::string cang_txt = std::isnan(cang)
+                                       ? std::string("   (无)")
+                                       : std::to_string(cang * 180.0 / M_PI) + "°";
+      RCLCPP_INFO(LOGGER,
+                  "  解候选 %zu/%zu: 代价 %8.3f 合拢轴(物体系) %+7.1f° 注释角 %s "
+                  "→ 偏离主轴 %4.1f°%s 绕接近轴 %5.1f°",
+                  i, solutions.size(), s->cost(), yaw * 180.0 / M_PI, cang_txt.c_str(),
+                  align * 180.0 / M_PI, aligned ? " ✓正对" : " ✗斜夹", rot * 180.0 / M_PI);
+      if (!best || (aligned && !best_aligned) ||
+          (aligned == best_aligned && rot < best_rot - 1e-9)) {
+        best = s;
+        best_aligned = aligned;
+        best_rot = rot;
+      }
+    }
+    return best;
   }
 
 private:
@@ -525,7 +642,7 @@ mtc::Task MTCTaskNode::createTask(const GraspRequest& request) {
       stage->setAngleDelta(angle_delta_);
       stage->setMonitoredStage(initial_state_ptr);
 
-      auto wrapper = std::make_unique<mtc::stages::ComputeIK>("grasp pose IK", std::move(stage));
+      auto wrapper = std::make_unique<mtc::stages::ComputeIK>(kGraspIkStage, std::move(stage));
       wrapper->setMaxIKSolutions(static_cast<uint32_t>(max_ik_solutions_));
       wrapper->setMinSolutionDistance(1.0);
       wrapper->setProperty("timeout", ik_timeout_);  // IK 总预算，默认 0.5s（见头文件说明）
@@ -803,13 +920,28 @@ GraspResult MTCTaskNode::run(const GraspRequest& request) {
     result.message = "MTC 未找到可行解（规划失败）";
     return result;
   }
-  task_.introspection().publishSolution(*task_.solutions().front());
-  RCLCPP_INFO(LOGGER, "找到 %zu 个解，执行第一个", task_.solutions().size());
-  dumpSolution(*task_.solutions().front());
-  fixTrajectoryTimes(*task_.solutions().front());
+  // ★ 选解：不再无脑取"代价最小"的第一个解，而是优先"合拢轴正对物体主轴、且绕接近轴
+  //   转得最少"的那个（见 pickSolution 的说明）。量不到合拢轴时退回原行为（取第一个）✓
+  mtc::SolutionBaseConstPtr chosen = pickSolution(request.object_box_center.orientation);
+  if (!chosen) {
+    chosen = task_.solutions().front();
+    RCLCPP_WARN(LOGGER, "所有解都量不到合拢轴 → 退回改动前的行为：执行代价最小的那个");
+  } else {
+    double yaw = 0.0, cang = 0.0;
+    if (graspClosingYaw(*chosen, request.object_box_center.orientation, yaw, cang))
+      RCLCPP_INFO(LOGGER,
+                  "从 %zu 个解里选中一个：代价 %.3f 合拢轴(物体系) %+.1f° 绕接近轴偏 %.1f°"
+                  "（注释角 %+.1f° 是 MTC 的写法，比真实采样角大一个 angle_delta）",
+                  task_.solutions().size(), chosen->cost(), yaw * 180.0 / M_PI,
+                  std::abs(std::remainder(yaw + M_PI / 2, M_PI)) * 180.0 / M_PI,
+                  cang * 180.0 / M_PI);
+  }
+  task_.introspection().publishSolution(*chosen);
+  dumpSolution(*chosen);
+  fixTrajectoryTimes(*chosen);
 
   // 5) execute
-  const auto execute_result = task_.execute(*task_.solutions().front());
+  const auto execute_result = task_.execute(*chosen);
   if (execute_result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
     RCLCPP_ERROR(LOGGER, "任务执行失败，错误码 %d", execute_result.val);
     result.stage = GraspStage::EXEC_FAILED;
