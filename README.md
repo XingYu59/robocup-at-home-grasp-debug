@@ -1,8 +1,16 @@
-> ## 🔧 抓取调试交接（2026-09-14）
+> ## 🔧 抓取调试交接（2026-09-18 更新）
 > **接手调试请先看 [HANDOFF.md](HANDOFF.md)** —— 现状、未解问题与方向、工具、复现命令、踩过的坑都在那里；
-> 详细交接文档集中在 [`docs/handoff/`](docs/handoff/)。
-> 一句话现状：整条链已跑通到 `stage=0` ✓，但**物理夹持仍未成功** ✗
-> （现象：夹爪看着包住物体、能闭合，物体纹丝不动；日志 `两指真实间距` 合到指令值 = 两指之间是空的 ✗）。
+> 详细交接文档集中在 [`docs/handoff/`](docs/handoff/)（最新一份：
+> [观察位扫视 + 导航不再绕桌 / 抓取精度与容错](docs/handoff/HANDOFF_nav_survey_and_grasp_tolerance_2026-09-18.md)）。
+> 一句话现状：整条链跑到 `stage=0` ✓，但 `stage=0` **不等于夹住了**（MTC 的 attach 只是逻辑附着 ✗）；
+> 现在唯一判据是日志里的 `★ 夹到没有: [contact] / [empty]`，空合会自动换偏置重抓 ✓
+> **改完先跑三条离线自检**（不用起仿真）：
+> ```bash
+> cd ~/Robocup@home_ws && source install/setup.bash
+> python3 src/HANDOFF_harness/check_dining_view_geometry.py   # 观察/近看/站位几何 + 目标选择
+> python3 src/HANDOFF_harness/test_grasp_retry.py             # 接触判据 + 偏置重抓阶梯
+> python3 src/HANDOFF_harness/test_closure_phase.py           # 合拢时刻判定（既有回归）
+> ```
 
 # TurtleBot3 + FR3 导航仿真
 

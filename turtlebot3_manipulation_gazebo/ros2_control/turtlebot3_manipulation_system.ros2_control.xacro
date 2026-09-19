@@ -184,8 +184,35 @@ https://github.com/ros-controls/ros2_control_demos/blob/foxy/ros2_control_demo_d
         </state_interface>
       </joint>
 
-      <!-- FR3 finger (only joint1; joint2 is URDF mimic handled by Gazebo physics) -->
+      <!-- ★ FR3 两个手指关节：**两个都必须声明成受控关节**（2026-09-18 修的真 bug）
+           背景：URDF 里 `fr3_finger_joint2` 靠 `<mimic joint="fr3_finger_joint1"/>` 联动，
+           但 **Fortress 的 sdformat12 = SDF 1.9 不支持 mimic（SDF 1.10+ 才有）**，实测：
+             $ ign sdf -p <生成的 urdf> | grep -c mimic   ⇒  **0**（整条被丢掉）
+           ⇒ joint2 在仿真里是【被动关节】：没有任何驱动（原来只声明了 joint1），
+             于是停在 URDF 默认值 0 = **闭合端**，而 joint1 的 initial_value = 0.04 = 张开 ✗
+           ⇒ 物理上"右指内侧面"永远停在夹爪中线附近（y ≈ 0），
+             而规划层（URDF 带 mimic）以为它在 y = −q
+           ⇒ 计划中的 80 mm 对称开口，物理上只有 ~40 mm 且偏离轴线 ~20 mm ✗✗
+             顶抓时右指正好落在物体【轴线上】⇒ 下降被物体顶面挡住、臂停在半路：
+               tomato_soup_can（顶 0.881 / 计划 TCP 0.868）⇒ 停在比计划高 22 mm 处
+               sugar_box     （顶 0.955 / 计划 TCP 0.9195）⇒ 高 45 mm
+             现场现象正是"指尖顶在物体顶面、伸不下去" ✓（与现场日志完全对得上）
+           修法：joint2 也声明成受控关节（位置指令 + 状态），
+                 并由 scripts/finger_mimic_relay.py 把 joint1 的值转发给它 ⇒ 两指真正对称 ✓ -->
       <joint name="fr3_finger_joint1">
+        <command_interface name="position">
+          <param name="min">0.0</param>
+          <param name="max">0.04</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0.04</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="fr3_finger_joint2">
         <command_interface name="position">
           <param name="min">0.0</param>
           <param name="max">0.04</param>

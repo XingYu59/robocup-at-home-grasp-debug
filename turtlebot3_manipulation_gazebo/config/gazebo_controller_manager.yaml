@@ -18,6 +18,13 @@ controller_manager:
     gripper_controller:
       type: position_controllers/GripperActionController
 
+    # ★ 2026-09-18：第二个手指的控制器（Fortress 不支持 URDF mimic ⇒
+    #   joint2 必须自己受控，否则它当"被动关节"停在闭合端 ✗，
+    #   详见 ros2_control/turtlebot3_manipulation_system.ros2_control.xacro 的注释）
+    #   指令来源：scripts/finger_mimic_relay.py 把 joint1 的值原样转发过来 ✓
+    finger2_controller:
+      type: forward_command_controller/ForwardCommandController
+
 diff_drive_controller:
   ros__parameters:
     use_sim_time: True
@@ -107,3 +114,9 @@ gripper_controller:
   ros__parameters:
     use_sim_time: True
     joint: fr3_finger_joint1
+
+finger2_controller:
+  ros__parameters:
+    use_sim_time: True
+    joints: ["fr3_finger_joint2"]
+    interface_name: position

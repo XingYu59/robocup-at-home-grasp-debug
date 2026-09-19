@@ -42,6 +42,7 @@ import time
 
 import numpy as np
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
@@ -150,6 +151,113 @@ def _yaw_from_params(params_path, default=0.0):
         return default
 
 
+def needs_grasp_mode(found, want_pre, graspable, mode="auto"):
+    """要不要切到「抓取模式」（= 闭集复核，能命名 objects.yaml 里的全部 18 类）？
+
+    found     = 第 1 帧（队友默认 4 类词表 apple/coke can/bowl/banana + 复核）认出来的类别
+    want_pre  = 调用方请求的类别（已过滤到目录表里的）
+    graspable = 目录表里 graspable=true 的类别
+    mode      = 本节点参数 grasp_mode：always / auto / never
+
+    ★ 为什么需要把这条判据写清楚（2026-09-19 现场实证，一次 8 连败）：
+      驱动在观察位/近看位共调了 8 次（3 个角度 + 5 个角度），**全部**回
+      "no detection / no class matched"、0 目标；而视觉日志里那几帧明明认出了
+      coke can 0.59~0.88 / apple 0.35~0.43（默认 4 类词表里的东西，**不是调用方要的类**）
+      ⇒ 旧判据 `not any(c in graspable for c in f0)` 只问"默认词表里有没有可夹的东西"，
+        **完全不管调用方点了哪几类** ⇒ 只要画面里出现任何可夹的东西（哪怕是隔壁桌的
+        coke can）就永远不切模式 ⇒ 调用方要的 potted_meat_can 之类的类
+        **永远没机会被命名** ⇒ 响应恒为 "no class matched" ✗✗
+      修法：调用方点了类就按它判 —— 第 1 帧里**没有它**就切 ✓
+      （点了多类时任意一类出现即可不切；没点类时保持原行为 ✓）
+    """
+    if mode == "always":
+        return True
+    if mode != "auto":
+        return False
+    # ★ 2026-09-19（第二版）：**调用方点了类 ⇒ 一律走闭集复核** ✓
+    #   为什么：默认 4 类词表只能命名 apple/coke can/bowl/banana 这 4 类，
+    #   而抓取侧请求的是 objects.yaml 的类别（18 类，含 tomato_soup_can / potted_meat_can…）
+    #   ⇒ 只要那一帧里恰好认出一个"在那 4 类里、又正好被请求"的东西（哪怕是幻影
+    #     banana/apple ✗），旧判据就不切模式 ⇒ 整帧只能给出 4 类里的名字
+    #     ⇒ 抓取侧拿到的是**幻影类别**（现场 12:20：apple 报在隔壁餐桌位置）✗✗
+    #   ⇒ 判据改成：点了类就用闭集复核（那才是唯一能命名目录表全部类别的路）；
+    #     没点类时保持队友原来的 auto 语义（默认 4 类先试，没可抓的再切）✓
+    if want_pre:
+        return True
+    return not any(c in graspable for c in found)
+
+
+def face_dev_mm(meas_w, meas_h, dims):
+    """实测 (横向, 竖直) 与某类目录尺寸的最小偏差（mm）。可见面可能是 (d,h) 也可能是 (w,h) ✓"""
+    d0, w0, h0 = dims
+    if h0 <= 0 or meas_w is None or meas_h is None:
+        return None
+    return min(math.hypot(meas_w - x0, meas_h - h0) for x0 in (d0, w0)) * 1000.0
+
+
+def relabel_decision(meas_w, meas_h, label, want, catalog,
+                     gross_mm=30.0, gross_rel=0.45, want_mm=12.0, want_rel=0.18,
+                     better=0.6, rival=1.3):
+    """标签与实测尺寸**明显**不自洽、而调用方要的类**明显**更自洽时，才改成调用方要的类。
+
+    ★ 为什么必须这么严（2026-09-19 10:42 现场教训，我第一版放松到"高度误差 ≤15 mm"就翻车了）：
+        那一趟调用方要 potted_meat_can，分类器**认对了**（'tomato_soup_can' 0.36），
+        但番茄罐的掩码实测是 **55×90 mm**（真值 66×101，低了 ~11% —— SAM2 在几十像素的
+        物体上盖不满，是**系统性偏小**），而 potted_meat_can 的目录是 50×97×82
+        ⇒ 高度误差只有 8 mm，"符合"了 ✗✗ ⇒ 标签被改成 potted_meat_can
+        ⇒ 驱动去抓**番茄罐**，并且因为合爪间距 61.3 ≈ 它自己的宽度，还报了"抓取成功" ✗✗
+        根因：**单视角的 (横向,竖直) 分不开 82 mm 的方盒和 101 mm 的圆柱**
+        （可见面长宽比 0.61 vs 0.65 太接近，而实测又整体偏小 10% ⇒ 小一号的物体冒充目标类别）。
+      ⇒ 唯一安全的规则：**分类器自己的标签只要还自洽，就绝不改它** ✓
+
+    判据（三道都要过）：
+      · gross：标签的偏差 > max(gross_mm, gross_rel·标签高度) ⇒ 标签"明显不自洽"
+        （现场：chips_can 250 mm vs 实测 74 mm = 176 mm ⇒ 是 ✓ 该改；
+                tomato_soup_can 101 vs 实测 90 mm = 16 mm ⇒ 否 ✓ 不该改）
+      · want ：调用方要的类偏差 ≤ max(want_mm, want_rel·该高度)，且 ≤ better×标签偏差
+      · rival：目录里没有别的类比"调用方要的类"更接近（近于 rival 倍）⇒ 防挑错
+
+    返回 (cls|None, 说明)。
+    """
+    if meas_w is None or meas_h is None or not label:
+        return None, "没有实测尺寸"
+    lab = (catalog.get(label) or {}).get("dims")
+    if not lab:
+        return None, "标签 {!r} 不在目录表里".format(label)
+    dev_lab = face_dev_mm(meas_w, meas_h, lab)
+    g = max(gross_mm, gross_rel * lab[2] * 1000.0)
+    if dev_lab is None or dev_lab <= g:
+        return None, ("标签 {!r} 的尺寸偏差只有 {:.0f} mm（阈值 {:.0f} mm）⇒ 标签自洽，不改 ✗"
+                      .format(label, -1.0 if dev_lab is None else dev_lab, g))
+    hits = []
+    for c in want:
+        dims = (catalog.get(c) or {}).get("dims")
+        if not dims:
+            continue
+        dev = face_dev_mm(meas_w, meas_h, dims)
+        if dev is None:
+            continue
+        if dev > max(want_mm, want_rel * dims[2] * 1000.0):
+            continue
+        if dev > better * dev_lab:
+            continue
+        hits.append((dev, c))
+    if not hits:
+        return None, ("标签 {!r} 偏差 {:.0f} mm 确实大，但调用方要的 {} 也对不上（实测 {:.0f}×{:.0f} mm）"
+                      "⇒ 不改").format(label, dev_lab, list(want), meas_w * 1000, meas_h * 1000)
+    hits.sort()
+    for c, dims in catalog.items():
+        if c == hits[0][1] or c == label:
+            continue
+        dev = face_dev_mm(meas_w, meas_h, dims["dims"])
+        if dev is not None and dev < rival * hits[0][0]:
+            return None, ("实测 {:.0f}×{:.0f} mm 与 {!r} 一样接近（{:.0f} mm < {:.0f} mm）⇒ 不猜"
+                          .format(meas_w * 1000, meas_h * 1000, c, dev, rival * hits[0][0]))
+    c = hits[0][1]
+    return c, ("标签 {!r} 偏差 {:.0f} mm（> {:.0f} mm ⇒ 明显不自洽），而 {!r} 只差 {:.0f} mm"
+               "⇒ 按实测尺寸改标").format(label, dev_lab, g, c, hits[0][0])
+
+
 class DetectGraspTargetNode(Node):
     """提供 /detect_grasp_target 服务：检测 + 3D 定位 + 换算成契约点。"""
 
@@ -195,6 +303,12 @@ class DetectGraspTargetNode(Node):
         #     完全不用深度图）——与深度链路独立，天然躲开"掩码吃进桌面/背景导致偏远"
         #  ② mask_erode_px：掩码先腐蚀几像素，躲开彩色/深度不对齐的毛边
         #  ③ 距离闸门（在 _mask_points_cam 里，无需参数）：只留物体自己那一簇深度
+        # ★ 2026-09-18：掩码像素"算不算落在桌面上"的判据（补丁③ 桌面剔除）
+        #   相机高出桌面仅 39 mm ⇒ 物体前方那条桌面比物体近 ~100 mm，
+        #   掩码吃进它就会把抓取点整体拉近（现场实证：0.385 vs 0.458 m）。
+        #   15 mm ≈ 深度噪声（stddev 7 mm）的 2σ；调大 → 剔得更狠（可能误剔物体底面几行）；
+        #   设 0 即关闭该剔除（回到改动前行为 ✓）
+        self.declare_parameter("table_pixel_tol", 0.015)
         self.declare_parameter("position_source", "auto")   # auto | plane | mask
         self.declare_parameter("mask_erode_px", 2)
         self.declare_parameter("plane_min_den", 0.10)       # 平面约束条件数下限
@@ -211,12 +325,27 @@ class DetectGraspTargetNode(Node):
         #     后退量系数：契约点 = 可见面 + 沿水平视线后退 系数·min(d,w)/2
         self.declare_parameter("backoff_scale", 1.0)
         # ★ 2026-09-16：相机外参平移无法用任何现有检查验证（桌平面校验对水平平移免疫 ✗），
-        #   但实测证据一致指向"报出的 base 点偏深 30~45 mm"：
-        #     · 像素宽度独立验证相机系距离 ✓（109 px ⇒ 0.321 m vs 报 0.317 m，差 4 mm）
-        #     · 偏置扫描里"比契约点浅 40 mm"时手指已经碰到罐子 ⇒ 真值比报的近 ≥40 mm
-        #   本参数把契约点沿【视线】朝相机方向平移（负值 = 拉近），默认 -0.045 m。
-        #   设为 0.0 即回到未补偿行为 ✓
-        self.declare_parameter("contract_range_offset", -0.022)   # 二分：0=太深✗、-0.045=太浅✗ ⇒ 取中点
+        #   当时按"报出的 base 点偏深 30~45 mm"补了一个朝相机方向的平移，二分取 −0.022。
+        # ★ 2026-09-18 改成 **0.0（不补偿）**，理由（三条，都是实测）：
+        #   ① 用户现场观察（2026-09-18 实跑）："夹爪落在番茄罐**前面一些**" —— 偏浅约 2 cm，
+        #      而本参数正好是"朝相机拉近 22 mm" ⇒ 方向、量级都吻合它自己造成的偏浅 ✗
+        #   ② 当初的二分依据站不住：`sweep_offset` 径向 ±40 mm 九档**全部空合**
+        #      （.run/sweep_offset_20260916_213228.log 的结论明写"空合原因不是径向偏深"）
+        #      ⇒ 没有任何一次实验证明过"报出的点偏深" ✗
+        #   ③ 真正的偏浅根因已单独修掉（补丁③ 桌面剔除：掩码吃进物体前方那条桌面 ⇒
+        #      相机只高 39 mm 时它比物体近 ~100 mm）⇒ 不能用"再往前拉 22 mm"去抵消它 ✗
+        #   想恢复旧行为：`-p contract_range_offset:=-0.022`（或按新证据标定一个值）✓
+        self.declare_parameter("contract_range_offset", 0.0)
+        # ★ 2026-09-19：**横向修正**（相机系 x，正值 = 往机器人右手边挪）
+        #   为什么需要：现有所有自检（桌平面校验 / 尺寸法 vs 深度法 / 掩码法 vs 框心法）
+        #   对"相机→base 的横向平移"**全部免疫** ✗，而现场残留的位姿误差正好是这个量级
+        #   （1~3 cm）⇒ 只能靠"手指接触"这种外部手段测出来，再在这里一次性补偿 ✓
+        #   怎么测：跑一次抓取，看驱动日志里的
+        #     「重测[N] … 被推走 XX mm（Δx=…, Δy=…）⇒ 修正偏置更新为 (a, b) mm」
+        #   连续几次收敛到同一个 (a, b) ⇒ 那就是视觉的系统偏差 ⇒
+        #     -p contract_lateral_offset:=<相机系横向分量>  一次性抵消掉 ✓
+        #   （相机系 x = 车身向右；base y ≈ −相机 x，换算注意符号 ✓）
+        self.declare_parameter("contract_lateral_offset", 0.0)
         self.declare_parameter("yaw_backoff", True)         # 长方体按支撑函数后退
         self.declare_parameter("table_check", True)         # 每次检测顺带校验桌平面
         self.declare_parameter("map_frame", "map")
@@ -245,6 +374,7 @@ class DetectGraspTargetNode(Node):
         self.size_hi = float(p("size_ratio_hi"))
         self.vote_frames = max(1, int(p("vote_frames")))
         self.position_source = str(p("position_source") or "auto").lower()
+        self.table_pixel_tol = float(p("table_pixel_tol"))
         self.mask_erode_px = max(0, int(p("mask_erode_px")))
         self.plane_min_den = float(p("plane_min_den"))
         # ④ 契约点前移：轴向（视线方向）分位数 + 后退量系数（见 declare 处的说明）
@@ -282,13 +412,25 @@ class DetectGraspTargetNode(Node):
                 "$(prefix)/lib/turtlebot3_manipulation_navigation2）——先 source 工作区的 install/setup.bash")
 
         # ── 数据缓存：三路话题各留最新一帧 ──────────────────────
+        # ★ 2026-09-18 修一个真 bug：订阅回调必须和【服务回调】分在不同的回调组里。
+        #   rclpy 里同一个节点默认只有一个 MutuallyExclusiveCallbackGroup ⇒
+        #   服务回调（一次 20~60 s）跑着的时候，相机/深度/内参回调**全被挡住** ✗
+        #   ⇒ 缓存冻结：等"新一帧"永远等不到（日志里出现过"5s 内没有新图"），
+        #     多帧投票也只能反复跑同一张图（等于没投票）✗
+        #   修法：订阅放 ReentrantCallbackGroup、服务单独一组 →
+        #   MultiThreadedExecutor 的其它线程能继续收图 ✓
+        self._sub_cb_group = ReentrantCallbackGroup()
+        self._srv_cb_group = MutuallyExclusiveCallbackGroup()
         self._lock = threading.Lock()
         self._img = None
         self._depth = None
         self._info = None
-        self.create_subscription(Image, p("image_topic"), self._on_image, 1)
-        self.create_subscription(Image, p("depth_topic"), self._on_depth, 1)
-        self.create_subscription(CameraInfo, p("camera_info_topic"), self._on_info, 1)
+        self.create_subscription(Image, p("image_topic"), self._on_image, 1,
+                                 callback_group=self._sub_cb_group)
+        self.create_subscription(Image, p("depth_topic"), self._on_depth, 1,
+                                 callback_group=self._sub_cb_group)
+        self.create_subscription(CameraInfo, p("camera_info_topic"), self._on_info, 1,
+                                 callback_group=self._sub_cb_group)
 
         # ── TF ──────────────────────────────────────────────────
         self._tf_buffer = tf2_ros.Buffer()
@@ -310,7 +452,8 @@ class DetectGraspTargetNode(Node):
             self._ann_pub = self.create_publisher(_Img, self.annotated_topic, 1)
 
         self._srv = self.create_service(
-            DetectGraspTarget, "/detect_grasp_target", self.handle_detect)
+            DetectGraspTarget, "/detect_grasp_target", self.handle_detect,
+            callback_group=self._srv_cb_group)
         self.get_logger().info(
             "就绪：/detect_grasp_target（相机 {} → 目标帧 {}）；标注图 → {} {}"
             .format(self.camera_frame, self.target_frame, self.annotated_topic,
@@ -481,19 +624,36 @@ class DetectGraspTargetNode(Node):
 
         为什么需要：跳过复核后开集标签会错（实测 apple 被标成 coke can 0.602 ✗）。
         类的尺寸差得远时（碗 0.16 被标成罐 0.067）这一步就能拦掉 ✗
-        返回 (ok, 实测跨度, 期望区间)。
+
+        ★ 2026-09-18（P0-B）：下限改成【随距离放宽】——
+          实测（运行日志）：真目标 tomato_soup_can 在 1.22 m 处只有 ~29 px，
+          SAM2 掩码只盖住约 40% 宽度 ⇒ 实测横向 0.027 m，而固定下限 0.7×0.066 = 0.046 m
+          ⇒ **一连 4~5 帧全被丢掉** ⇒ 结果里只剩邻桌幻影 ⇒ 目标选择被劫持 ✗
+          （这不是"标签错了"，而是"远处掩码天然盖不满"）
+          现在下限：0.7×narrow（近处 ≤0.6 m）线性放宽到 0.35×narrow（远处 ≥1.0 m）✓
+            实测数字：罐在 1.22 m 处实测横向 0.027 m ⇒ 0.35×0.066 = 0.023 ≤ 0.027 ⇒ 保留 ✓
+                      同一只罐若在 0.45 m 处也只盖 0.027 m ⇒ 0.7×0.066 = 0.046 > 0.027
+                      ⇒ 仍然丢弃 ✓（近处盖不满 = 掩码真框错了东西，不该放行）
+          上界不动（防的是"把大物体认成小类"，与距离无关）。
+          ⚠ 放宽的副作用：远处掩码只盖住物体一侧时横向中心会偏（估计 ~10 mm）
+            ⇒ 由抓取侧的"侧向偏置重抓阶梯"吸收（grasp_phase.GRASP_RETRY_OFFSETS）✓
+        返回 (ok, 实测跨度, 期望区间, 距离)。
         """
         if not self.size_check or cls not in self.object_sizes or pts_cam is None:
-            return True, None, None
+            return True, None, None, 0.0
         d, w, h = self.object_sizes[cls]
         if d <= 0 or w <= 0:
-            return True, None, None
+            return True, None, None, 0.0
         # 用 2%~98% 分位而不是 max-min：同样是为了不被掩码边缘/桌面污染放大 ✗
         lo, hi = np.percentile(pts_cam[:, 0], [2, 98])
         obs = float(hi - lo)                                             # 相机系 x = 横向
         narrow, diag = min(d, w), math.hypot(d, w)
-        ok = (narrow * self.size_lo) <= obs <= (diag * self.size_hi)
-        return ok, obs, (narrow * self.size_lo, diag * self.size_hi)
+        # 距离（相机系中位深度）→ 下限放宽系数
+        z = float(np.median(pts_cam[:, 2])) if pts_cam.shape[0] else 0.0
+        t = min(1.0, max(0.0, (z - 0.6) / 0.4)) if z > 0 else 0.0
+        lo_ratio = self.size_lo - (self.size_lo - 0.35) * t
+        ok = (narrow * lo_ratio) <= obs <= (diag * self.size_hi)
+        return ok, obs, (narrow * lo_ratio, diag * self.size_hi), z
 
     @staticmethod
     def _to_target_frame(pts_cam, tf):
@@ -644,7 +804,36 @@ class DetectGraspTargetNode(Node):
             [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
         ])
 
-    def _mask_points_cam(self, mask, depth, k, cls=None, patch=False):
+    def _box_dims(self, det, depth, k):
+        """用检测框的像素尺寸 + 框内深度中值，粗估物体的 (横向, 竖向) 物理尺寸（m）。
+
+        精度不高（框比物体松、还有掩码外扩），但用来判"高度是不是差几倍"足够 ✓
+        （现场要区分：实测 ~0.074 m 的扁罐头 vs 目录高度 0.25 m 的 chips_can ✗）
+        取不到深度就返回 (None, None)，调用方按"量不到"处理（不做纠正）✓
+        """
+        box = det.get("box_xyxy")
+        if box is None or depth is None or k is None:
+            return None, None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            fx, fy = float(k[0]), float(k[4])
+            h, w = depth.shape[:2]
+            u1, u2 = max(0, int(min(x1, x2))), min(w, int(max(x1, x2)))
+            v1, v2 = max(0, int(min(y1, y2))), min(h, int(max(y1, y2)))
+            if u2 - u1 < 2 or v2 - v1 < 2:
+                return None, None
+            win = np.asarray(depth[v1:v2, u1:u2], dtype=float)
+            win = win[np.isfinite(win) & (win > 0)]
+            if win.size < 4:
+                return None, None
+            z = float(np.median(win))
+            if z > 100.0:                      # 毫米编码
+                z /= 1000.0
+            return (u2 - u1) * z / fx, (v2 - v1) * z / fy
+        except Exception:                      # noqa: BLE001
+            return None, None
+
+    def _mask_points_cam(self, mask, depth, k, cls=None, patch=False, tf=None):
         """掩码 + 深度 → 相机光学系点云（N×3），返回 (pts, ys, stats)。
 
         ★ 2026-09-15 补丁①【距离闸门】：只留"物体自己那一簇"深度。
@@ -652,6 +841,19 @@ class DetectGraspTargetNode(Node):
           为前缘，只保留 [前缘, 前缘 + 物体最大尺寸 + 3 cm] 以内的像素 ✓
           stats 回报剔除比例：剔得多 ⇒ 掩码确实在吃背景（"偏远"的直接证据 ✓）
         ★ 补丁②【腐蚀】：掩码先腐蚀几像素，躲开彩色/深度不对齐的毛边
+        ★ 2026-09-18 补丁③【桌面剔除】—— 修"抓取点偏近（夹爪停在物体前面）"✓
+          掩码底边经常吃进"物体**前方**的一小条桌面"（SAM2 常把接触区/阴影带进来）。
+          相机只高出桌面 39 mm（视线几乎与桌面平行）⇒ 同一条视线里，
+          物体前方那条桌面比物体**近得多**（实测：0.45 m 处的糖盒，它前方桌面只有 0.35 m）
+          ⇒ 取"最近 5% 分位"当可见面时，那几行桌面像素会把抓取点整体拉近 ~100 mm ✗
+          （2026-09-18 现场日志实证：掩码法轴心 0.385 m vs 独立的地面测距 0.458 m，差 74 mm，
+            而"已知尺寸测距"（掩码宽 106 px → 0.45 m）站在 0.45 这一边 ⇒ 掩码法偏近 ✓；
+            用户现场看到"抓取点不够靠后、夹爪停在物体前面" ✓）
+          桌面是**已知平面**（support_z + 相机外参）⇒ 逐像素反解"若它落在桌面上应有的深度"
+          Z_t：实测 |Z − Z_t| < 15 mm ⇒ 该像素就在桌面上，剔除 ✓
+          （对**物体**像素这条永不成立：同一视线里物体比桌面近，Z < Z_t − 物体抬起的高度）
+          护栏：被剔比例 ≥ 80% 说明整个掩码都在桌面上（多半是误检）→ 不剔除 + 回告警，
+          交给尺寸/高度核对去拦 ✗；stats["drop_table"] 回报剔除比例供日志判读 ✓
         """
         if mask is None or depth is None:
             return None
@@ -690,6 +892,36 @@ class DetectGraspTargetNode(Node):
                 stats["z_lo"] = z_lo
                 stats["drop_far"] = 1.0 - float(keep.sum()) / float(n0)
                 xs, ys, zs = xs[keep], ys[keep], zs[keep]
+        # ── 补丁③ 桌面剔除（需要相机外参 tf；拿不到就跳过，行为与改动前一致 ✓）
+        if patch and tf is not None and zs.size >= 40:
+            try:
+                qt = tf.transform.rotation
+                tt = tf.transform.translation
+                R = np.array([
+                    [1 - 2*(qt.y*qt.y + qt.z*qt.z), 2*(qt.x*qt.y - qt.z*qt.w),
+                     2*(qt.x*qt.z + qt.y*qt.w)],
+                    [2*(qt.x*qt.y + qt.z*qt.w), 1 - 2*(qt.x*qt.x + qt.z*qt.z),
+                     2*(qt.y*qt.z - qt.x*qt.w)],
+                    [2*(qt.x*qt.z - qt.y*qt.w), 2*(qt.y*qt.z + qt.x*qt.w),
+                     1 - 2*(qt.x*qt.x + qt.y*qt.y)],
+                ])
+                fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+                den = (R[2, 0] * (xs - cx) / fx + R[2, 1] * (ys - cy) / fy + R[2, 2])
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    z_tab = (self.support_z - tt.z) / den      # 该像素"在桌面上"应有的深度
+                valid = np.isfinite(z_tab) & (np.abs(den) > 1e-3) & (z_tab > 0.05)
+                on_table = valid & (np.abs(zs - z_tab) < self.table_pixel_tol)
+                if on_table.any():
+                    frac = float(on_table.sum()) / float(zs.size)
+                    stats["drop_table"] = frac
+                    if frac < 0.8:
+                        xs, ys, zs = xs[~on_table], ys[~on_table], zs[~on_table]
+                    else:
+                        stats["table_only"] = frac
+            except Exception as e:                     # noqa: BLE001
+                stats["table_filter_err"] = "{}: {}".format(type(e).__name__, e)
+        if zs.size == 0:
+            return None
         fx, cx, fy, cy = k[0], k[2], k[4], k[5]
         if fx <= 0 or fy <= 0:
             return None
@@ -964,6 +1196,9 @@ class DetectGraspTargetNode(Node):
                                    "横向中位数/轴向低分位抑制 ✓"
                                    .format(z10, z90, (z90 - z10) * 1000))
         # ★ 沿视线拉近/推远（相机系 z = 视线方向）；默认 -0.045 见参数说明 ✓
+        lat = float(self.get_parameter("contract_lateral_offset").value)
+        if abs(lat) > 1e-9:
+            p_cam = np.array([p_cam[0] + lat, p_cam[1], p_cam[2]])
         zc = p_cam[2] + float(self.get_parameter("contract_range_offset").value)
         if zc > 0.05:
             p_cam = np.array([p_cam[0], p_cam[1], zc])
@@ -1056,9 +1291,7 @@ class DetectGraspTargetNode(Node):
             self.get_logger().info("第 1/{} 帧（默认 4 类+复核）: {}（{:.1f}s）".format(
                 N, {k: round(v[0], 2) for k, v in f0.items()}, time.time() - t0))
 
-            grasp_mode_on = (self.grasp_mode == "always"
-                             or (self.grasp_mode == "auto"
-                                 and not any(c in graspable for c in f0)))
+            grasp_mode_on = needs_grasp_mode(f0.keys(), want_pre, graspable, self.grasp_mode)
             if grasp_mode_on:
                 if 0 < len(want_pre) <= 6:
                     prompt_use, mode_txt = (" . ".join(c.replace("_", " ") for c in want_pre) + " .",
@@ -1066,8 +1299,16 @@ class DetectGraspTargetNode(Node):
                 else:
                     prompt_use, mode_txt = (self.grasp_prompt,
                                             "抓取模式(全 {} 类, 闭集复核)".format(len(self.catalog)))
-                self.get_logger().warn("默认词表里没有可抓目标 → {} ".format(mode_txt)
-                                       + "（召回优先；误检靠多帧投票 + 尺寸核对 + 窄词表复核压下去）")
+                if want_pre:
+                    # ★ 2026-09-19：把"为什么切"说清楚 —— 现场那次就是因为没人看出
+                    #   默认词表认出了别的东西（coke can）却仍不切模式 ✗
+                    self.get_logger().warn(
+                        "第 1 帧（默认 4 类词表）认出 {}，里面没有调用方要的 {} → {} "
+                        .format(sorted(f0.keys()) or "（空）", want_pre, mode_txt)
+                        + "（召回优先；误检靠多帧投票 + 尺寸核对 + 窄词表复核压下去）")
+                else:
+                    self.get_logger().warn("默认词表里没有可抓目标 → {} ".format(mode_txt)
+                                           + "（召回优先；误检靠多帧投票 + 尺寸核对 + 窄词表复核压下去）")
                 frames = [_frame(prompt_use, True)]           # 第 1 帧用新 prompt 重跑（复核开着）
             else:
                 prompt_use, mode_txt = None, "默认(4 类 + 复核)"
@@ -1172,7 +1413,8 @@ class DetectGraspTargetNode(Node):
                             if bad else "   ✓ 四者一致"))
 
             ann_items = []          # 标注图用：(class, score, box, 轴心点)
-            seen_cls = {}           # 类别 → 置信度
+            seen_cls = {}           # 类别 → 置信度（同类去重用，未经惩罚）
+            conf_out = {}           # 类别 → 输出置信度（尺寸核对不过时 ×0.7）
             for d, own_vocab, conf_voted in dets_all:
                 # 抓取模式用自己的词表归类；默认路径用队友的（模块级函数）
                 cls = (self._classify_catalog(d.get("phrase")) if own_vocab
@@ -1182,26 +1424,64 @@ class DetectGraspTargetNode(Node):
                         self.get_logger().info("  抓取模式：phrase {!r} 对不上 objects.yaml 任何类别，丢弃"
                                                .format(d.get("phrase")))
                     continue                       # 词表外的（干扰物）直接丢
-                if want and cls not in want:
-                    continue
-                if seen_cls.get(cls, -1.0) >= float(conf_voted):
-                    continue                       # 同类已有更高置信度的框
-                got = self._mask_points_cam(d.get("mask"), depth, k, cls, patch=bool(own_vocab))
+                # ★ 掩码点先算（下面的"标签按尺寸纠正"要用**实测尺寸**；见 shape_fit_class）
+                got = self._mask_points_cam(d.get("mask"), depth, k, cls,
+                                            patch=bool(own_vocab), tf=tf)
                 if got is None:
                     self.get_logger().warn("  {} 掩码处没有有效深度，跳过".format(cls))
                     continue
                 pts_cam, ys, mstats = got
+                if want and cls not in want:
+                    # ★ 2026-09-19：分类器标签错了不要紧，**尺寸不会错** —— 实测尺寸与
+                    #   调用方要的类相符就按调用方要的类走（推导见 shape_fit_class）。
+                    #   现场：potted_meat_can 被叫 chips_can(0.48)/sugar_box(0.35)，
+                    #   实测高度 0.074 m 与目录 0.082 相符、与 chips_can 0.25 ✗
+                    #   ⇒ 旧代码在这里 continue ⇒ 调用方恒得 "no class matched" ✗✗
+                    _ok_s, obs_m, _rng_s, _z = self._size_ok(cls, pts_cam)
+                    _ok_h, h_m, _rng_h = self._height_ok(cls, pts_cam, tf)
+                    src_m = "掩码实测"
+                    if obs_m is None or h_m is None:
+                        obs_m, h_m = self._box_dims(d, depth, k)
+                        src_m = "框×深度粗估"
+                    fit, why = relabel_decision(obs_m, h_m, cls, want, self.catalog)
+                    if fit is None:
+                        self.get_logger().info(
+                            "  [{}→?] 标签 {!r} 不在调用方要的 {} 里：{}（{}）⇒ 丢弃"
+                            .format(cls, d.get("phrase"), list(want), why, src_m))
+                        continue
+                    self.get_logger().warn(
+                        "  ★ 标签按实测尺寸纠正: {!r} → {!r}（{}；{}；原置信度 {:.2f}）".format(
+                            cls, fit, why, src_m, float(conf_voted)))
+                    cls = fit
+                if seen_cls.get(cls, -1.0) >= float(conf_voted):
+                    continue                       # 同类已有更高置信度的框
                 if mstats.get("drop_far", 0.0) > 0.02:
                     self.get_logger().warn(
                         "  距离闸门[{}]: 剔除 {}% 远处像素（前缘 {:.3f} m）→ 掩码确实在吃"
                         "桌面/背景；已剔除 ✓".format(
                             cls, 100.0 * mstats["drop_far"], mstats.get("z_lo", 0.0)))
-                ok_size, obs, rng = self._size_ok(cls, pts_cam)
-                if not ok_size:
+                if mstats.get("drop_table", 0.0) > 0.005:
                     self.get_logger().warn(
-                        "  {} 尺寸核对不过：实测横向 {:.3f} m 不在期望 {:.3f}~{:.3f} m → 丢弃"
-                        "（多半是开集标签错了）".format(cls, obs, rng[0], rng[1]))
-                    continue
+                        "  桌面剔除[{}]: 掩码里有 {}% 像素就落在桌面上（相机只高 39 mm ⇒ "
+                        "它们比物体近得多）→ 已剔除 ✓（不剔会把抓取点拉近）".format(
+                            cls, 100.0 * mstats["drop_table"]))
+                if mstats.get("table_only", 0.0) > 0.0:
+                    self.get_logger().warn(
+                        "  ⚠ 桌面剔除[{}]: 掩码 {}% 像素都在桌面上（整个掩码是桌面？）"
+                        "→ 不剔除，交给尺寸/高度核对判 ✗".format(
+                            cls, 100.0 * mstats["table_only"]))
+                ok_size, obs, rng, z_obj = self._size_ok(cls, pts_cam)
+                conf_pen = 1.0
+                if not ok_size:
+                    # ★ 2026-09-18（P0-B）：尺寸核对不过 → 【置信度惩罚】而不是丢弃整帧。
+                    #   为什么改：硬丢帧会让"远处的真目标"整帧消失（掩码盖不满是距离造成的，
+                    #   不是标签错），结果只剩邻桌幻影 → 目标选择被劫持 ✗（运行日志实测）
+                    #   惩罚后交给多帧投票 + 支撑面打分 + 抓取点重测去压 ✓
+                    conf_pen = 0.7
+                    self.get_logger().warn(
+                        "  {} 尺寸核对不过：实测横向 {:.3f} m 不在期望 {:.3f}~{:.3f} m"
+                        "（距离 {:.2f} m）→ 只降置信度 ×0.7 保留候选，不再整帧丢弃 ✓".format(
+                            cls, obs, rng[0], rng[1], z_obj))
                 ok_h, obs_h, rng_h = self._height_ok(cls, pts_cam, tf)
                 if not ok_h:
                     self.get_logger().warn(
@@ -1209,6 +1489,9 @@ class DetectGraspTargetNode(Node):
                         "（标的类别高矮不符，照它抓会抓空）".format(cls, obs_h, rng_h[0], rng_h[1]))
                     continue
                 seen_cls[cls] = float(conf_voted)
+                # 输出用的置信度（尺寸核对不过时已 ×0.7：降权但保留候选，不再整帧丢 ✗）
+                conf_out[cls] = float(conf_voted) * conf_pen
+
                 # ★ 独立第二算法：**框中心像素的深度**（完全不用掩码）
                 #   掩码法会被桌面/背景 bleed 拉偏，而框中心像素基本落在物体正面上 ✓
                 #   两者一比就知道"位置估计是不是可信" —— 这是唯一还没验证的环节
@@ -1309,7 +1592,8 @@ class DetectGraspTargetNode(Node):
                 tgt.header.frame_id = self.target_frame
                 tgt.header.stamp = self.get_clock().now().to_msg()   # 本次检测时刻
                 tgt.class_id = cls
-                tgt.confidence = float(conf_voted)      # 多帧投票后的置信度（比单帧稳）
+                # 多帧投票后的置信度（比单帧稳）；尺寸核对不过的已 ×0.7 降权 ✓
+                tgt.confidence = float(conf_out.get(cls, conf_voted))
                 tgt.point.x, tgt.point.y, tgt.point.z = (
                     float(point[0]), float(point[1]), float(point[2]))
                 response.targets.append(tgt)

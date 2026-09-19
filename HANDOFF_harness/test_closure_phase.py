@@ -18,6 +18,7 @@
     python3 HANDOFF_harness/test_closure_phase.py
 （直接跑即可：模块 import 不到 ROS 时会退化成桩依赖 —— 被测的两个函数本来就是纯函数）
 """
+import math
 import os
 import sys
 import types
@@ -237,17 +238,29 @@ class _FakeFuture:
         return G.GraspFixedObject.Response()
 
 
+_FAKE_SIZES = {"coke can": (0.067, 0.067, 0.1239)}   # 圆柱：d/w = 1.00 ⇒ 形状闸门会降级 ✓
+
+
 class _FakeGrasp:
     """假 self：只提供 call_grasp 用到的成员（不碰真 ROS、不发服务）。"""
-
-    def __init__(self, series):
+    def __init__(self, series, cls="potted_meat_can", tf_yaw=-2.019, normal=(0.0, 1.0)):
         self.series = series                      # [(x, z, gap_mm), ...] 每次采样一项
         self.i = 0
         self.log = _FakeLog()
         self._finger_q = 0.040
-        self.object_sizes = {}
+
+        self._finger_q2 = 0.040
+        # (depth, width, height)：默认 potted_meat_can（长方体 50×97），coke can 用圆柱尺寸 ✓
+        self.object_sizes = {cls: _FAKE_SIZES.get(cls, (0.050, 0.097, 0.082))}
         self.close_squeeze = 0.0
         self.grasp_client = types.SimpleNamespace(call_async=self._call_async)
+        # ★ 合拢轴核对（★ 行）要用：桌沿法线 + TF 报的 map←base_footprint 位姿
+        self.obs_normal = normal                  # map 系、轴对齐
+        self._tf_yaw = tf_yaw
+        self._cls = cls
+
+    def _robot_map_pose(self):
+        return (2.19, 2.61, self._tf_yaw)
 
     def _call_async(self, req):
         self.i = 0                                # 进服务后再开始正式采样
@@ -279,10 +292,14 @@ def make_target(x, y, z, class_id="tomato_soup_can"):
     return t
 
 
-def run_call_grasp(series):
-    """跑一遍真 call_grasp，返回它打出来的日志行。"""
-    fake = _FakeGrasp(series)
-    tgt = make_target(TGT[0], TGT[1], 0.845)
+def run_call_grasp(series, cls="potted_meat_can", tf_yaw=-2.019, normal=(0.0, 1.0)):
+    """跑一遍真 call_grasp，返回它打出来的日志行。
+
+    tf_yaw 默认 −2.019 rad = −115.7°（**现场那一趟** TF 报的 map 偏航），
+    命令的站位 yaw = −90°（法线 (0,1)）⇒ φ = −25.7° ⇒ ★ 合拢轴核对 必须报"超过开口" ✓
+    """
+    fake = _FakeGrasp(series, cls=cls, tf_yaw=tf_yaw, normal=normal)
+    tgt = make_target(TGT[0], TGT[1], 0.845, class_id=cls)
     real_rclpy, G.rclpy = G.rclpy, types.SimpleNamespace(ok=lambda: True)
     try:
         G.GraspPhase.call_grasp(fake, tgt, [])
@@ -328,6 +345,77 @@ print("  ── call_grasp 实际打出来的那两行（现场日志长这样�
 for m in log9:
     if "合拢" in m:
         print("  " + m)
+
+print("\n" + "=" * 72)
+print("用例⑨b 假对象真跑 call_grasp：★ 合拢轴核对（现场 φ=−25.7° 必须判「夹不进去」）")
+_axis = [m for m in log9 if "★ 合拢轴核对" in m]
+check("打出了 ★ 合拢轴核对 那一行", len(_axis) == 1, str(_axis))
+if _axis:
+    check("该行给出的 φ = −25.7°（TF −115.7° vs 命令 −90°）",
+          "φ=-25.7°" in _axis[0], _axis[0])
+    check("该行按长方体 50×97 算出需要的开口 87.1 mm > 上限 80 mm ⇒ 判「超过开口」",
+          "87.1 mm" in _axis[0] and "超过开口" in _axis[0], _axis[0])
+    check("该行指出后果：两指压物体顶面推走 / 两指之间是空的",
+          "推走" in _axis[0] and "空的" in _axis[0], _axis[0])
+    print("  ── 现场会打出来的那一行 ──")
+    print("  " + _axis[0])
+# 车头正对桌沿（φ=0）时不许报"超过开口"
+_ok_log = run_call_grasp(series_from(
+    phase(10, 80.0, 80.0, 0.214, 0.366, 0.845, 0.845),
+    phase(9, 80.0, 57.0, 0.366, 0.366, 0.845, 0.845),
+    phase(6, 57.0, 57.0, 0.366, 0.366, 0.845, 0.845)), tf_yaw=-math.pi / 2)
+_axis_ok = [m for m in _ok_log if "★ 合拢轴核对" in m]
+check("φ=0°（TF = 命令 yaw = −90°）时 φ 报 +0.0° 且开口 = 50.0 mm、不报超限",
+      bool(_axis_ok) and "φ=+0.0°" in _axis_ok[0] and "50.0 mm" in _axis_ok[0]
+      and "超过开口" not in _axis_ok[0], str(_axis_ok))
+# 圆柱（d/w=1.0）时降级为提示，不许报"超过开口"
+_cyl_log = run_call_grasp(series_from(
+    phase(10, 80.0, 80.0, 0.214, 0.366, 0.845, 0.845),
+    phase(9, 80.0, 57.0, 0.366, 0.366, 0.845, 0.845),
+    phase(6, 57.0, 57.0, 0.366, 0.366, 0.845, 0.845)),
+    cls="coke can", tf_yaw=-2.019)
+_axis_cyl = [m for m in _cyl_log if "★ 合拢轴核对" in m]
+check("圆柱(66×66) 即使 φ=−25.7° 也只提示「合拢轴偏了不改变开口」、不报超限",
+      bool(_axis_cyl) and "不改变开口" in _axis_cyl[0] and "超过开口" not in _axis_cyl[0],
+      str(_axis_cyl))
+
+# ══════════════════ 用例⑩：合拢轴偏 φ 时的开口（closing_span_mm）══════════════════
+# 2026-09-19 现场：potted_meat_can 停在物体顶上、合到指令间距而两指之间是空的。
+# 候选根因：合拢轴是【算出来的】（box_yaw = object_yaw_map − robot_yaw_map(TF)），
+# 这个偏航偏 φ，长方体在合拢方向的投影就膨胀；超过 80 mm 开口就几何上跨不进去。
+# 这条式子是"一眼判死活"的硬指标 ⇒ 在离线下把它钉死 ✓
+print("\n" + "=" * 72)
+print("用例⑩ closing_span_mm：合拢轴偏 φ 后，长方体需要的开口（上限 80 mm）")
+_has_span = hasattr(G, "closing_span_mm")
+check("grasp_phase 里有 closing_span_mm（★ 合拢轴核对用它）", _has_span, "属性不存在")
+if _has_span:
+    _pmc = (0.050, 0.097)          # potted_meat_can：窄边 50 mm、长边 97 mm
+    s0 = G.closing_span_mm(_pmc[0], _pmc[1], 0.0)
+    check("φ=0° → 50.0 mm（正好等于窄边）", abs(s0 - 50.0) < 0.05, "{:.2f}".format(s0))
+    s15 = G.closing_span_mm(_pmc[0], _pmc[1], math.radians(15.0))
+    check("φ=15° → 73.4 mm（贴上限，只能啃两个角）",
+          abs(s15 - 73.4) < 0.2, "{:.2f}".format(s15))
+    s90 = G.closing_span_mm(_pmc[0], _pmc[1], math.radians(90.0))
+    check("φ=90° → 97.0 mm（合拢轴对到长边 ⇒ 必然夹不进去）",
+          abs(s90 - 97.0) < 0.2, "{:.2f}".format(s90))
+    _crit = None
+    for _k in range(0, 900):                       # 0.1° 步长找临界角
+        if G.closing_span_mm(_pmc[0], _pmc[1], math.radians(_k * 0.1)) > 80.0:
+            _crit = _k * 0.1
+            break
+    check("临界角 ≈ 19.8°（超过就 > 80 mm 开口 ⇒ 几何上夹不进去）",
+          _crit is not None and abs(_crit - 19.8) < 0.2, "实测 {:.1f}°".format(_crit or -1))
+    # 现场那次：日志 box_yaw(规划帧)=115.7°，而车头本该正对桌沿（命令 yaw −90°）⇒ φ≈25.7°
+    s_fail = G.closing_span_mm(_pmc[0], _pmc[1], math.radians(25.7))
+    check("现场 φ=25.7° → 87.1 mm ✗ 超开口（与「手停在罐顶、合到指令间距却没夹到」一致）",
+          s_fail > 80.0 and abs(s_fail - 87.1) < 0.3, "{:.2f}".format(s_fail))
+    s_sq = G.closing_span_mm(0.066, 0.066, math.radians(45.0))
+    check("方盒(66×66) 在 φ=45° → 93.3 mm（对角线）⇒ 式子是【长方体】模型；"
+          "圆柱由调用方的形状闸门排除（d/w < 1.15）",
+          abs(s_sq - 93.34) < 0.3, "{:.2f}".format(s_sq))
+    s_cb = G.closing_span_mm(0.060, 0.158, math.radians(10.0))
+    check("cracker_box(60×158) 偏 10° → 86.5 mm ✗ 薄长盒一偏就废",
+          s_cb > 80.0 and abs(s_cb - 86.5) < 0.3, "{:.2f}".format(s_cb))
 
 # ══════════════════ 汇总 ══════════════════
 print("\n" + "=" * 72)

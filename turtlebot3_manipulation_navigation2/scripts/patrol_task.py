@@ -108,6 +108,10 @@ DEBUG_IMAGE_DIR = os.path.expanduser("~/turtlebot3_detections")
 # 务必改成本队的真实组号，否则评分系统按无效文件处理。
 GROUP_NUMBER = 3
 
+# ★ 2026-09-19：上面这几个常量（GROUP_NUMBER / NAME_TO_JSON / TARGET_CLASSES_JSON）
+#   现在由 config/count_items.yaml 覆盖（见 main() 开头调用的 count_items.apply_from_config）
+#   ⇒ 换个比赛题目只改那个 yaml，不用动本文件 ✓（这里的值只是"没有配置时"的兜底）
+
 # 答案输出目录。自测时把 <GROUP_NUMBER>_answer.json 放进 submissions/，
 # 即可直接跑 src/scoring/score_submission.py。可用环境变量 ANSWER_OUTPUT_DIR 覆盖。
 ANSWER_OUTPUT_DIR = os.environ.get(
@@ -778,6 +782,28 @@ def main():
     args, _ = parser.parse_known_args()
     if args.no_sim_time:
         globals()["USE_SIM_TIME"] = False      # 必须在建节点之前改
+
+    # ★ 2026-09-19：**待计数物品清单**（基础题：裁判现场发布三个物品名）
+    #   来源 config/count_items.yaml（一处配置）⇒ 这里一次性同步三处词表 ✓
+    #   为什么必须在这里（建节点/建流水线之前）：三处都是**模块级常量**（import 时定死 ✗）：
+    #     ① vision_pipeline.ITEM_NAMES/ITEM_ALIASES/TEXT_PROMPT（开集 prompt + 归一表）
+    #     ② insid3_review.TARGET_CLASSES（闭集复核保留过滤）
+    #     ③ 本文件的 NAME_TO_JSON/TARGET_CLASSES_JSON（答案 JSON 类别集合，必须与裁判一致）
+    #   改完只需重启本节点（视觉模型 ~10 s），**不用改任何代码** ✓
+    # 软链场景兜底：本脚本在 install/ 里是软链，而 count_items.py 可能是**新加的、
+    # 还没重建进 install** ⇒ 先把"脚本真实所在目录"（= 源码树 scripts/）加进 sys.path ✓
+    import sys as _sys
+    _here = os.path.dirname(os.path.realpath(__file__))
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    import count_items
+    _items, _answers, _group = count_items.apply_from_config(log=print)
+    if _items:
+        globals()["NAME_TO_JSON"] = {it["name"]: it["name"].replace(" ", "_")
+                                     for it in _items}
+        globals()["TARGET_CLASSES_JSON"] = list(_answers)
+    if _group:
+        globals()["GROUP_NUMBER"] = int(_group)
 
     print("=== patrol_task starting ===", flush=True)
     rclpy.init()

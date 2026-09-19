@@ -1,10 +1,11 @@
 <?xml version="1.0"?>
 <sdf version="1.8">
-  <world name="robocup_home_official">
+  <world name="home">
     <physics name="1ms" type="ignored">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
     </physics>
+
     <plugin filename="ignition-gazebo-physics-system"
             name="gz::sim::systems::Physics"/>
     <plugin filename="ignition-gazebo-user-commands-system"
@@ -17,14 +18,14 @@
     </plugin>
     <gravity>0 0 -9.81</gravity>
     <scene>
-      <ambient>0.4 0.4 0.4 1</ambient>
+      <ambient>0.7 0.7 0.7 1</ambient>
       <background>0.92 0.92 0.92 1</background>
       <shadows>true</shadows>
     </scene>
     <light name="sun" type="directional">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 8 0 0 0</pose>
-      <diffuse>0.7 0.7 0.7 1</diffuse>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
       <specular>0.2 0.2 0.2 1</specular>
       <direction>-0.4 0.2 -1</direction>
     </light>
@@ -64,8 +65,8 @@
         </visual>
       </link>
     </model>
-    <!-- RoboCup@Home 房间墙体（static）。位姿与尺寸保持原布局。 -->
-    <model name="RoboCup_Home">
+    <!-- 房间墙体（static）。位姿与尺寸保持原布局。 -->
+    <model name="Home">
       <static>true</static>
       <pose>0.0595 -0.023998 0 0 0 0</pose>
       <link name="Wall_10">
@@ -1265,20 +1266,36 @@
         </visual>
       </link>
     </model>
+    <!-- 地面上一个白色正方体小块 -->
+    <model name="white_block">
+      <static>true</static>
+      <pose>-2.7 -1.2 0.1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.2 0.2 0.2</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.2 0.2 0.2</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
     <!--
       可抓/可动物体：通过 include 引用包内 model.sdf，避免与资源定义双份维护。
       name 仅为 Gazebo 仿真侧实例标识；机器人侧不会收到模型名或几何。
     -->
-    <include>
-      <uri>model://apple</uri>
-      <name>apple</name>
-      <pose>0.652391 -3.02886 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://apple</uri>
-      <name>apple_clone</name>
-      <pose>0.521706 -2.85381 0.78 0.002626 0.007625 0.00267</pose>
-    </include>
     <include>
       <uri>model://apple</uri>
       <name>apple_clone_0</name>
@@ -1290,29 +1307,14 @@
       <pose>-3.47568 -3.40265 0.78 -0.005582 0.006263 -0.003267</pose>
     </include>
     <include>
+      <uri>model://apple</uri>
+      <name>apple_clone_2</name>
+      <pose>0.63 -2.6 0.78 0 0 0</pose>
+    </include>
+    <include>
       <uri>model://coke_can</uri>
       <name>coke_can</name>
       <pose>-2.35337 -0.061656 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://coke_can</uri>
-      <name>coke_can_clone</name>
-      <pose>-3.52104 -3.58476 0.78 -0.01128 0.003765 0.077734</pose>
-    </include>
-    <include>
-      <uri>model://coke_can</uri>
-      <name>coke_can_clone_0</name>
-      <pose>-3.32141 -2.1472 0.78 -0.01128 0.003765 0.077734</pose>
-    </include>
-    <include>
-      <uri>model://bleach_cleanser</uri>
-      <name>bleach_cleanser</name>
-      <pose>-3.07057 -2.15704 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://bleach_cleanser</uri>
-      <name>bleach_cleanser_0</name>
-      <pose>-1.83 -0.11 0.8 0 0 0</pose>
     </include>
     <include>
       <uri>model://bowl</uri>
@@ -1320,60 +1322,96 @@
       <pose>2.6716 2.015 0.78 0 0 0</pose>
     </include>
     <include>
+      <uri>model://banana</uri>
+      <name>banana</name>
+      <pose>-3.3 -2.1 0.78 0 0 0</pose>
+    </include>
+    <include>
       <uri>model://coke_can</uri>
-      <name>coke_can_0</name>
-      <pose>3.14347 2.10831 0.78 0 0 0</pose>
+      <name>coke_can_1</name>
+      <pose>-3.5 -3.1 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://bowl</uri>
+      <name>bowl_1</name>
+      <pose>-3.5 -2.8 0.78 0 0 0</pose>
+    </include>
+
+    <!-- 闭集复核参考图用：把 models/ 里 14 个干扰物各放一个到桌面上。
+         目标类 apple/coke_can/bowl/banana 已在上方 include。z=0.78 与桌面齐平。 -->
+    <include>
+      <uri>model://beer</uri>
+      <name>beer</name>
+      <pose>1.1 2.0 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://bleach_cleanser</uri>
+      <name>bleach_cleanser</name>
+      <pose>1.5 2.0 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://chips_can</uri>
+      <name>chips_can</name>
+      <pose>1.9 2.0 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cracker_box</uri>
+      <name>cracker_box</name>
+      <pose>2.3 1.5 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://gelatin_box</uri>
+      <name>gelatin_box</name>
+      <pose>2.7 1.5 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://master_chef_can</uri>
+      <name>master_chef_can</name>
+      <pose>3.1 1.5 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://mustard_bottle</uri>
+      <name>mustard_bottle</name>
+      <pose>1.1 1.5 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://pitcher_base</uri>
+      <name>pitcher_base</name>
+      <pose>1.5 1.5 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://potted_meat_can</uri>
+      <name>potted_meat_can</name>
+      <pose>1.9 1.5 0.78 0 0 0</pose>
+    </include>
+    <!-- ★ 2026-09-14 用户批准的换物体实验：餐桌 3 上的 pudding_box 换成番茄汤罐（圆柱） -->
+    <!--   目的：把"物体本身的问题"与"抓取算法的问题"分开 —— 圆柱是最友好的抓取目标 -->
+    <!--   （轴心点最稳、24 个采样角里 12 个可行）。想还原就把下面这段换回 pudding_box -->
+    <!--   （原始内容在 example.world.bak_before_can ✓） -->
+    <include>
+      <uri>model://tomato_soup_can</uri>
+      <name>tomato_soup_can_t3</name>
+      <pose>2.3 2.0 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://sugar_box</uri>
+      <name>sugar_box</name>
+      <pose>3.1 2.0 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://tomato_soup_can</uri>
+      <name>tomato_soup_can</name>
+      <pose>-3.7 -2.1 0.78 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://tuna_fish_can</uri>
+      <name>tuna_fish_can</name>
+      <pose>-2.9 -2.1 0.78 0 0 0</pose>
     </include>
     <include>
       <uri>model://windex_bottle</uri>
       <name>windex_bottle</name>
-      <pose>2.9 2.08 0.78 0 0 0</pose>
+      <pose>0.63 -2.2 0.78 0 0 0</pose>
     </include>
-    <include>
-      <uri>model://banana</uri>
-      <name>banana</name>
-      <pose>2.3 2.06 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://banana</uri>
-      <name>banana_0</name>
-      <pose>-3.6 -2 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://bowl</uri>
-      <name>bowl_0</name>
-      <pose>0.64 -2.58 0.78 0 0 0</pose>
-    </include>
-    <include>
-      <uri>model://windex_bottle</uri>
-      <name>windex_bottle_0</name>
-      <pose>0.78 -2.3 0.78 0 0 0</pose>
-    </include>
-
-    <model name="white_block">
-      <static>true</static>
-      <pose>-0.07 1.99 0.10 0 0 0</pose>
-      <link name="link">
-        <collision name="collision">
-          <geometry>
-            <box>
-              <size>1.0 1.0 1.0</size>
-            </box>
-          </geometry>
-        </collision>
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>1.0 1.0 1.0</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>1 1 1 1</ambient>
-            <diffuse>1 1 1 1</diffuse>
-            <specular>0.1 0.1 0.1 1</specular>
-          </material>
-        </visual>
-      </link>
-    </model>
   </world>
 </sdf>

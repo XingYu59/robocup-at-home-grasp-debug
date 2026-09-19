@@ -1,0 +1,560 @@
+diff --git a/turtlebot3_manipulation_grasp/scripts/detect_grasp_target_node.py b/turtlebot3_manipulation_grasp/scripts/detect_grasp_target_node.py
+index 5cdbf1a..3189724 100755
+--- a/turtlebot3_manipulation_grasp/scripts/detect_grasp_target_node.py
++++ b/turtlebot3_manipulation_grasp/scripts/detect_grasp_target_node.py
+@@ -15,6 +15,9 @@ srv/DetectGraspTarget.srv 写，不改视觉侧任何代码）：
+        camera_rgb_optical_frame，像素一一对应
+     2. vision_pipeline.VisionPipeline().detect(bgr) → 框 + 掩码 + 掩码质心
+        classify_phrase(phrase) 归一到 ITEM_NAMES；不在词表里的丢掉
++       ★ 2026-09-18：每个"投票帧"都取 stamp 不同的新图（原来整个服务调用只用
++         回调开头那一张图，"N 帧投票"= 同一张确定性推理 N 遍，零信息量 ✗）；
++         位置逐帧独立计算后取中位数融合（见 handle_detect 的融合段）
+     3. 掩码 + 深度 → 相机系点云 → TF(camera_rgb_optical_frame → base_footprint)
+        → 得到物体【可见表面】的质心（机器人内部固定变换，不含 AMCL 误差）
+     4. 换算成契约要求的点：**物体中心轴 ∩ 支撑面**（z = 支撑面高度）。
+@@ -42,6 +45,7 @@ import time
+ 
+ import numpy as np
+ import rclpy
++from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+ from rclpy.executors import MultiThreadedExecutor
+ from rclpy.node import Node
+ from rclpy.time import Time
+@@ -182,9 +186,13 @@ class DetectGraspTargetNode(Node):
+         self.declare_parameter("height_check", True)
+         self.declare_parameter("height_ratio_lo", 0.55)      # 实测/期望 下限（掩码缺边时留余量）
+         self.declare_parameter("height_ratio_hi", 1.80)      # 上限
+-        # 多帧投票：连续取 N 帧各检一次，某类别要在 ≥⌈2N/3⌉ 帧出现才采纳（置信度取中位数）
++        # 多帧投票：每次取【新的一张图】（stamp 不同于上一帧）各检一次，
++        # 某类别要在 ≥⌈2N/3⌉ 帧出现才采纳（置信度取中位数）
+         # 为什么：假阳性是逐帧随机的（这帧冒 tuna fish can，下帧就没了），真目标稳定出现 ✓
+-        # 代价：每帧 ~4~9 s，N=3 大约多花 8~18 s
++        # ★ 2026-09-18 修复：原来所有"帧"跑在服务回调开头缓存的同一张图上（模型确定性
++        #   ⇒ 结果逐位相同），投票零信息、位置完全暴露于单帧掩码质量（实测跨调用差 4~20 cm）✗
++        #   现在每帧真取新图 + 位置逐帧算、按轴取中位数融合（handle_detect 融合段）
++        # 代价：每帧 ~4~9 s 是检测本身（与以前一样），等新图可忽略（相机 30 Hz）
+         self.declare_parameter("vote_frames", 3)
+         # ── ★ 位置补丁（2026-09-15）：位置估计的三处改动 ────────────
+         # 现场症状：糖盒/番茄罐都"夹空"，实测合爪间距=指令值 ⇒ 两指之间没有东西；
+@@ -309,8 +317,16 @@ class DetectGraspTargetNode(Node):
+             from sensor_msgs.msg import Image as _Img
+             self._ann_pub = self.create_publisher(_Img, self.annotated_topic, 1)
+ 
++        # ★ 服务必须放【独立的互斥回调组】：rclpy 的默认回调组是互斥的，
++        #   服务回调一执行（一次 20~60 s），同组的相机/TF//clock 订阅全部停摆 →
++        #   多帧投票逐帧取新图根本拿不到（2026-09-18 实测：日志连打
++        #   "帧 2/3/4: 5s 内没有新图"，三次"投票"跑在同一张图上 ✗）。
++        #   分组后：服务调用之间仍串行（组内互斥 ✓ 适配层非线程安全），
++        #   但不再阻塞订阅 → 服务执行期间相机数据照常进来 ✓
++        self._srv_group = MutuallyExclusiveCallbackGroup()
+         self._srv = self.create_service(
+-            DetectGraspTarget, "/detect_grasp_target", self.handle_detect)
++            DetectGraspTarget, "/detect_grasp_target", self.handle_detect,
++            callback_group=self._srv_group)
+         self.get_logger().info(
+             "就绪：/detect_grasp_target（相机 {} → 目标帧 {}）；标注图 → {} {}"
+             .format(self.camera_frame, self.target_frame, self.annotated_topic,
+@@ -552,6 +568,34 @@ class DetectGraspTargetNode(Node):
+             time.sleep(0.05)
+         return False
+ 
++    def _grab_frame(self, last_key, timeout=None):
++        """取一帧数据（RGB+深度+内参三路一起），要求 RGB 的 stamp 与 last_key 不同。
++
++        ★ 多帧投票的前提：只有"换了 stamp"才算新帧 —— 模型是确定性的，
++          同一张图推理 N 遍结果逐位相同，那不是投票 ✗（2026-09-18 修复的根因）。
++        等不到新帧（仿真暂停等）就退回最新一帧，fresh=False，由调用方决定告警。
++        返回 (img, depth_msg, info, key, fresh)；三路凑不齐时 img=None。
++        """
++        timeout = self.stream_timeout if timeout is None else timeout
++        deadline = time.time() + timeout
++        img = dep = info = None
++        fresh = False
++        key = last_key
++        while rclpy.ok() and time.time() < deadline:
++            with self._lock:
++                img, dep, info = self._img, self._depth, self._info
++            if (img is not None and dep is not None and info is not None
++                    and self._fresh_enough(img) and self._fresh_enough(dep)
++                    and self._fresh_enough(info)):
++                key = (img.header.stamp.sec, img.header.stamp.nanosec)
++                if key != last_key:
++                    fresh = True
++                    break
++            time.sleep(0.05)
++        if img is None or dep is None or info is None:
++            return None, None, None, last_key, False
++        return img, dep, info, key, fresh
++
+     # ── 图像解码（不用 cv_bridge：numpy 2.x 与 ROS 的 cv_bridge ABI 不兼容）──
+     @staticmethod
+     def _to_bgr(msg):
+@@ -920,7 +964,7 @@ class DetectGraspTargetNode(Node):
+                     slope=float(coef[0]), cam_h=float(t_base[2] - self.support_z))
+ 
+ 
+-    def _contract_point(self, pts_cam, tf, cls, bottom_band=False):
++    def _contract_point(self, pts_cam, tf, cls, bottom_band=False, verbose=True):
+         """相机系点云 → 契约点（物体中心轴 ∩ 支撑面，在 target_frame 里）。
+ 
+         · 可见表面质心在相机系 → 旋转/平移进 target_frame（只用机器人内部 TF）
+@@ -986,11 +1030,13 @@ class DetectGraspTargetNode(Node):
+         # ★ 补丁④-②：后退量打折（默认 0.85）—— 契约点再往相机一侧挪几毫米 ✓
+         back_scaled = back * self.backoff_scale
+         # 现场核对用：分位、轴向统计量的前移量、后退量前后值都打出来 ✓
+-        self.get_logger().info(
+-            "  契约点[{}]: 轴向 {:.0f}% 分位 {:.3f} m（比逐轴中位数 {:.3f} m 前移 {:.0f} mm）"
+-            "  后退 {:.0f} → {:.0f} mm（系数 {:.2f}）".format(
+-                cls, self.contract_axis_pct, z_axis, z_med, (z_med - z_axis) * 1000.0,
+-                back * 1000.0, back_scaled * 1000.0, self.backoff_scale))
++        # （verbose=False 供逐帧融合用：每帧一行会刷屏，细节进融合汇总行）
++        if verbose:
++            self.get_logger().info(
++                "  契约点[{}]: 轴向 {:.0f}% 分位 {:.3f} m（比逐轴中位数 {:.3f} m 前移 {:.0f} mm）"
++                "  后退 {:.0f} → {:.0f} mm（系数 {:.2f}）".format(
++                    cls, self.contract_axis_pct, z_axis, z_med, (z_med - z_axis) * 1000.0,
++                    back * 1000.0, back_scaled * 1000.0, self.backoff_scale))
+ 
+         x = p_tgt[0] + v[0] * back_scaled
+         y = p_tgt[1] + v[1] * back_scaled
+@@ -1015,11 +1061,11 @@ class DetectGraspTargetNode(Node):
+                 response.message = "vision pipeline unavailable: {}".format(self._vp_error)
+                 return response
+ 
++            # ── 先验一帧确认编码可用；检测用的图由 _frame 逐帧自取（见下）──
++            #    ★ 原来整次调用只用这一张图跑完所有"帧"—— 多帧投票失效的根因（2026-09-18 修复）
+             with self._lock:
+-                img_msg, depth_msg, info_msg = self._img, self._depth, self._info
+-            bgr = self._to_bgr(img_msg)
+-            depth = self._to_depth(depth_msg)
+-            if bgr is None or depth is None:
++                img_msg, depth_msg = self._img, self._depth
++            if self._to_bgr(img_msg) is None or self._to_depth(depth_msg) is None:
+                 response.message = "unsupported image encoding: {} / {}".format(
+                     img_msg.encoding, depth_msg.encoding)
+                 return response
+@@ -1032,9 +1078,39 @@ class DetectGraspTargetNode(Node):
+                 return response
+ 
+             # ══════════ 检测：多帧投票（+ 抓取模式的窄词表复核）══════════
+-            # 帧级检测函数：返回 {class: (conf, det)}（同一类取该帧里分最高的框）
++            # 帧级检测函数：返回 ({class: (conf, det)}, ctx)（同一类取该帧里分最高的框）。
++            # ★ 2026-09-18：每次调用都取一张【stamp 不同的新图】并把该帧的深度/内参
++            #   一起记进 frame_ctxs —— 原来所有"帧"跑在回调开头缓存的同一张 bgr 上，
++            #   确定性模型 ⇒ 结果逐位相同，投票零信息，位置完全暴露于单帧掩码质量
++            #   （实测跨调用位置差 4~20 cm）✗ 现在投票是真投票，且能逐帧融合位置 ✓
++            frame_ctxs = []          # [{"idx","key","bgr","depth","k","stamp"}] 按调用顺序
++
+             def _frame(prompt, use_rev):
+-                dets = self._detect_pass(bgr, prompt=prompt, use_reviewer=use_rev)
++                last_key = frame_ctxs[-1]["key"] if frame_ctxs else None
++                img, dep, info, key, fresh = self._grab_frame(last_key)
++                if img is None:
++                    self.get_logger().error("取不到相机帧（RGB/深度/内参缺一路）→ 这一帧没有结果")
++                    return {}, None
++                bgr_i = self._to_bgr(img)
++                depth_i = self._to_depth(dep)
++                if bgr_i is None or depth_i is None:
++                    self.get_logger().error(
++                        "新帧解码失败（{} / {}）→ 沿用上一帧的图".format(img.encoding, dep.encoding))
++                    if not frame_ctxs:
++                        return {}, None
++                    prev = frame_ctxs[-1]
++                    bgr_i, depth_i, key = prev["bgr"], prev["depth"], prev["key"]
++                    k_i, stamp_i = prev["k"], prev["stamp"]
++                else:
++                    k_i, stamp_i = info.k, img.header.stamp
++                ctx = {"idx": len(frame_ctxs) + 1, "key": key, "bgr": bgr_i,
++                       "depth": depth_i, "k": k_i, "stamp": stamp_i}
++                frame_ctxs.append(ctx)
++                if not fresh:
++                    self.get_logger().warn(
++                        "  帧 {:d}: {:.0f}s 内没有新图（仿真暂停？）→ 复用最新一帧，"
++                        "这一票与上一帧不独立 ✗".format(ctx["idx"], self.stream_timeout))
++                dets = self._detect_pass(bgr_i, prompt=prompt, use_reviewer=use_rev)
+                 out = {}
+                 for d in dets:
+                     c = (self._classify_catalog(d.get("phrase")) if prompt
+@@ -1044,7 +1120,7 @@ class DetectGraspTargetNode(Node):
+                     sc = float(d.get("score", 0.0))
+                     if sc > out.get(c, (0.0, None))[0]:
+                         out[c] = (sc, d)
+-                return out
++                return out, ctx
+ 
+             N = self.vote_frames
+             want_pre = [c for c in (request.class_ids or []) if c in self.catalog]
+@@ -1052,7 +1128,7 @@ class DetectGraspTargetNode(Node):
+ 
+             # ① 第 1 帧走队友默认（4 类 + 复核），用它决定要不要切抓取模式
+             t0 = time.time()
+-            f0 = _frame(None, True)
++            f0, _f0ctx = _frame(None, True)
+             self.get_logger().info("第 1/{} 帧（默认 4 类+复核）: {}（{:.1f}s）".format(
+                 N, {k: round(v[0], 2) for k, v in f0.items()}, time.time() - t0))
+ 
+@@ -1071,7 +1147,7 @@ class DetectGraspTargetNode(Node):
+                 frames = [_frame(prompt_use, True)]           # 第 1 帧用新 prompt 重跑（复核开着）
+             else:
+                 prompt_use, mode_txt = None, "默认(4 类 + 复核)"
+-                frames = [f0]
++                frames = [(f0, _f0ctx)]
+ 
+             # ② 其余帧
+             for fi in range(2, N + 1):
+@@ -1079,12 +1155,15 @@ class DetectGraspTargetNode(Node):
+                 fr = _frame(prompt_use, True)
+                 frames.append(fr)
+                 self.get_logger().info("第 {}/{} 帧（{}）: {}（{:.1f}s）".format(
+-                    fi, N, mode_txt, {k: round(v[0], 2) for k, v in fr.items()}, time.time() - t0))
++                    fi, N, mode_txt, {k: round(v[0], 2) for k, v in fr[0].items()}, time.time() - t0))
+ 
+             # ③ 投票：某类要在 ≥⌈2N/3⌉ 帧出现
+             need = max(1, math.ceil(N * 2.0 / 3.0))
+             tally = {}
+-            for fr in frames:
++            # ★ frames 的元素是 (out, ctx) —— out（检测结果 dict）在前、ctx 在后
++            #   （2026-09-18 现场翻车点：这里曾把顺序写反，fr 拿到 ctx，
++            #     ctx["idx"] 是 int → "cannot unpack non-iterable int object" ✗）
++            for fr, _fctx in frames:
+                 for c, (sc, d) in fr.items():
+                     tally.setdefault(c, []).append(sc)
+             # ★ 选哪一帧的框？**不能用"分数最高的那帧"** ✗（2026-09-14 现场定位到的根因）：
+@@ -1096,10 +1175,13 @@ class DetectGraspTargetNode(Node):
+             #   改成：取该类别所有帧框心的【中位数】，再用"离中位数最近的那帧"当代表 ✓
+             #   （单帧串到别的物体上就不再影响结果 ✓）并且把离散度打出来 ✓
+             voted = {}
++            samples = {}        # ★ class -> [(det, ctx)] 该类出现过的所有帧（每帧一次独立观测，融合用）
+             for c, scores in tally.items():
+                 if len(scores) < need:
+                     continue
+-                cds = [fr[c][1] for fr in frames if c in fr]
++                cds = [fr[c][1] for fr, _fctx in frames if c in fr]
++                samples[c] = [(fr[c][1], fctx) for fr, fctx in frames
++                              if c in fr and fctx is not None]
+                 cen = []
+                 for d in cds:
+                     b = d.get("box_xyxy")
+@@ -1144,20 +1226,29 @@ class DetectGraspTargetNode(Node):
+                 #   正确标签又改回错标签：实测闭集给的是 pudding_box(0.48)，
+                 #   窄词表复核把整张图改判成 cracker_box(0.43) ✗
+                 #   复核只该"用短词表重新打分"，标签仍然由闭集 argmax 决定 ✓
+-                fv = _frame(short, True)
++                fv, review_ctx = _frame(short, True)
+                 self.get_logger().info("复核结果: {}（{:.1f}s）".format(
+                     {k: round(v[0], 2) for k, v in fv.items()}, time.time() - t0))
+                 keep = {c: fv[c] for c in fv if c in voted}
+                 if keep:
+                     voted = keep
+-
+-            dets_all = [(v[1], bool(prompt_use), v[0]) for v in voted.values()]   # (det, own_vocab, 投票后置信度)
++                    # 复核帧是同一物体的又一次独立观测 → 并入该类的融合样本 ✓
++                    if review_ctx is not None:
++                        for c, (_sc_i, d_i) in keep.items():
++                            samples.setdefault(c, []).append((d_i, review_ctx))
++
++            # (cls, own_vocab, 投票后置信度, 逐帧样本列表) —— 位置逐帧算、取中位数（见下）
++            dets_all = []
++            for c, v in voted.items():
++                cls_samples = samples.get(c) or (
++                    [(v[1], frame_ctxs[-1])] if frame_ctxs else [])
++                dets_all.append((c, bool(prompt_use), v[0], cls_samples))
+ 
+             want = [c for c in (request.class_ids or []) if c]
+-            k = info_msg.k
+             # ★ 桌平面校验（一次调用一条）：深度+内参+外参+支撑面高度 四者同时验证
+-            if self.table_check and want:
+-                chk = self._table_plane_check(depth, k, tf)
++            #   用第 1 帧的数据（校验的是传感器本身，哪帧都行）
++            if self.table_check and want and frame_ctxs:
++                chk = self._table_plane_check(frame_ctxs[0]["depth"], frame_ctxs[0]["k"], tf)
+                 if chk is None:
+                     self.get_logger().warn(
+                         "  桌平面校验：找不到足够的桌面像素（相机没对着桌面？）")
+@@ -1173,42 +1264,100 @@ class DetectGraspTargetNode(Node):
+ 
+             ann_items = []          # 标注图用：(class, score, box, 轴心点)
+             seen_cls = {}           # 类别 → 置信度
+-            for d, own_vocab, conf_voted in dets_all:
+-                # 抓取模式用自己的词表归类；默认路径用队友的（模块级函数）
+-                cls = (self._classify_catalog(d.get("phrase")) if own_vocab
+-                       else self._vp_mod.classify_phrase(d.get("phrase")))
+-                if cls is None:
+-                    if own_vocab:
+-                        self.get_logger().info("  抓取模式：phrase {!r} 对不上 objects.yaml 任何类别，丢弃"
+-                                               .format(d.get("phrase")))
+-                    continue                       # 词表外的（干扰物）直接丢
++            for cls, own_vocab, conf_voted, cls_samples in dets_all:
+                 if want and cls not in want:
+-                    continue
++                    continue                       # 不是调用方要的类别
+                 if seen_cls.get(cls, -1.0) >= float(conf_voted):
+                     continue                       # 同类已有更高置信度的框
+-                got = self._mask_points_cam(d.get("mask"), depth, k, cls, patch=bool(own_vocab))
+-                if got is None:
+-                    self.get_logger().warn("  {} 掩码处没有有效深度，跳过".format(cls))
+-                    continue
+-                pts_cam, ys, mstats = got
+-                if mstats.get("drop_far", 0.0) > 0.02:
+-                    self.get_logger().warn(
+-                        "  距离闸门[{}]: 剔除 {}% 远处像素（前缘 {:.3f} m）→ 掩码确实在吃"
+-                        "桌面/背景；已剔除 ✓".format(
+-                            cls, 100.0 * mstats["drop_far"], mstats.get("z_lo", 0.0)))
+-                ok_size, obs, rng = self._size_ok(cls, pts_cam)
+-                if not ok_size:
+-                    self.get_logger().warn(
+-                        "  {} 尺寸核对不过：实测横向 {:.3f} m 不在期望 {:.3f}~{:.3f} m → 丢弃"
+-                        "（多半是开集标签错了）".format(cls, obs, rng[0], rng[1]))
+-                    continue
+-                ok_h, obs_h, rng_h = self._height_ok(cls, pts_cam, tf)
+-                if not ok_h:
++                # ★ 2026-09-18 位置融合：每帧独立算轴心点（各用各的掩码+深度+内参），
++                #   过了尺寸/高度核对的帧才参与，最后按轴取中位数 —— 单帧掩码多吃/少吃
++                #   几像素的桌面/背景只会拉偏它自己那一帧，中位数对少数帧的污染免疫 ✓
++                #   （原来只用一张图算一次，位置完全暴露于单帧掩码质量，跨调用差 4~20 cm ✗）
++                per_frame = []      # 该类通过全部核对的各帧结果
++                for det_i, ctx_i in cls_samples:
++                    if ctx_i is None:
++                        continue
++                    got = self._mask_points_cam(det_i.get("mask"), ctx_i["depth"], ctx_i["k"],
++                                                cls, patch=bool(own_vocab))
++                    if got is None:
++                        self.get_logger().warn("  {}（帧 {:d}）掩码处没有有效深度 → 该帧不参与融合"
++                                               .format(cls, ctx_i["idx"]))
++                        continue
++                    pts_cam_i, _ys_i, mstats_i = got
++                    if mstats_i.get("drop_far", 0.0) > 0.02:
++                        self.get_logger().warn(
++                            "  距离闸门[{}]（帧 {:d}）: 剔除 {}% 远处像素（前缘 {:.3f} m）"
++                            "→ 这帧掩码在吃桌面/背景；已剔除 ✓".format(
++                                cls, ctx_i["idx"], 100.0 * mstats_i["drop_far"],
++                                mstats_i.get("z_lo", 0.0)))
++                    ok_size_i, obs_i, rng_i = self._size_ok(cls, pts_cam_i)
++                    if not ok_size_i:
++                        self.get_logger().warn(
++                            "  {} 尺寸核对不过（帧 {:d}）：实测横向 {:.3f} m 不在 {:.3f}~{:.3f} m"
++                            " → 该帧不参与融合（多半是这帧标签/掩码错了）".format(
++                                cls, ctx_i["idx"], obs_i, rng_i[0], rng_i[1]))
++                        continue
++                    ok_h_i, obs_h_i, rng_h_i = self._height_ok(cls, pts_cam_i, tf)
++                    if not ok_h_i:
++                        self.get_logger().warn(
++                            "  {} 高度核对不过（帧 {:d}）：实测竖直跨度 {:.3f} m 不在 {:.3f}~{:.3f} m"
++                            " → 该帧不参与融合（标的类别高矮不符，照它抓会抓空）".format(
++                                cls, ctx_i["idx"], obs_h_i, rng_h_i[0], rng_h_i[1]))
++                        continue
++                    conv_i = self._contract_point(pts_cam_i, tf, cls, verbose=False)
++                    if conv_i is None:
++                        continue
++                    point_i, centroid_i, back_i = conv_i
++                    src_i = "掩码法"
++                    # ★ 地面约束测距（不看深度图）也逐帧算；两法差值就是该帧掩码质量
++                    #   的自检指标；位置源逐帧选（规则与原来一致：auto 时平面可用就采用）
++                    if own_vocab:
++                        gp_i, ginfo_i = self._ground_point(cls, det_i.get("mask"), ctx_i["k"], tf)
++                        if gp_i is not None:
++                            ok_p_i = bool(ginfo_i.get("ok"))
++                            drift_i = float(math.hypot(gp_i[0] - point_i[0], gp_i[1] - point_i[1]))
++                            if (self.position_source == "plane"
++                                    or (self.position_source == "auto" and ok_p_i)):
++                                point_i, centroid_i, back_i = gp_i, ginfo_i["front"], ginfo_i["back"]
++                                src_i = "地面测距"
++                            self.get_logger().info(
++                                "  融合帧[{:d}] {}: {} 轴心 base({:+.3f},{:+.3f}) | 地面测距"
++                                " base({:+.3f},{:+.3f}) 两法差 {:.0f} mm{}".format(
++                                    ctx_i["idx"], cls, src_i, point_i[0], point_i[1],
++                                    gp_i[0], gp_i[1], drift_i * 1000.0,
++                                    "" if ok_p_i else "（地面测距本轮不可用：{}）".format(
++                                        ginfo_i.get("why", ""))))
++                    per_frame.append(dict(ctx=ctx_i, det=det_i, pts_cam=pts_cam_i, point=point_i,
++                                          centroid=centroid_i, back=back_i, src=src_i,
++                                          obs=obs_i, obs_h=obs_h_i))
++                if not per_frame:
+                     self.get_logger().warn(
+-                        "  {} 高度核对不过：实测竖直跨度 {:.3f} m 不在期望 {:.3f}~{:.3f} m → 丢弃"
+-                        "（标的类别高矮不符，照它抓会抓空）".format(cls, obs_h, rng_h[0], rng_h[1]))
++                        "  {} 所有帧都没有可用位置（掩码/深度/核对全失败）→ 丢弃".format(cls))
+                     continue
+                 seen_cls[cls] = float(conf_voted)
++
++                if len(per_frame) >= 2:
++                    pts = np.stack([pf["point"] for pf in per_frame], axis=0)
++                    point = np.median(pts, axis=0)
++                    rep_i = int(np.argmin(np.linalg.norm(pts - point, axis=1)))
++                    spread = float(np.max(np.linalg.norm(pts - point, axis=1)))
++                    self.get_logger().info(
++                        "  融合[{}]: {} 帧中位数 base({:+.3f},{:+.3f},{:.3f})，帧间最大偏差 "
++                        "{:.0f} mm（{}）{}".format(
++                            cls, len(per_frame), point[0], point[1], point[2], spread * 1000.0,
++                            " / ".join("帧{:d}={}".format(pf["ctx"]["idx"], pf["src"])
++                                       for pf in per_frame),
++                            "   ⚠ 帧间偏差 >30mm，位置仍不稳（建议加 vote_frames 或再靠近）"
++                            if spread > 0.03 else "   ✓"))
++                else:
++                    point = per_frame[0]["point"]
++                    rep_i = 0
++                # 代表帧 = 离中位数最近的那帧（详细交叉核对/标注图都用它的数据）
++                rep = per_frame[rep_i]
++                ctx, d, pts_cam = rep["ctx"], rep["det"], rep["pts_cam"]
++                centroid_tgt, back = rep["centroid"], rep["back"]
++                obs, obs_h = rep["obs"], rep["obs_h"]
++                depth, k = ctx["depth"], ctx["k"]      # 下方交叉核对用代表帧的深度/内参
+                 # ★ 独立第二算法：**框中心像素的深度**（完全不用掩码）
+                 #   掩码法会被桌面/背景 bleed 拉偏，而框中心像素基本落在物体正面上 ✓
+                 #   两者一比就知道"位置估计是不是可信" —— 这是唯一还没验证的环节
+@@ -1271,40 +1420,8 @@ class DetectGraspTargetNode(Node):
+                                     xc["expect_lo"], xc["expect_hi"], xc["z_dep"]))
+                 except Exception as e:                      # noqa: BLE001
+                     self.get_logger().warn("  已知尺寸测距失败: {}: {}".format(type(e).__name__, e))
+-                conv = self._contract_point(pts_cam, tf, cls)
+-                if conv is None:
+-                    continue
+-                point, centroid_tgt, back = conv
+-                # ★ 补丁③ 地面约束测距 vs 掩码法：两条独立链路的结果都打出来，
+-                #   差值就是"位置偏置"的自检指标（两法都偏远 ⇒ 偏置在共用的外参/桌面假设上）
+-                gp, ginfo = ((None, {}) if not own_vocab
+-                             else self._ground_point(cls, d.get("mask"), k, tf))
+-                if gp is not None:
+-                    drift = float(math.hypot(gp[0] - point[0], gp[1] - point[1]))
+-                    ok_p = bool(ginfo.get("ok"))
+-                    self.get_logger().info(
+-                        "  地面测距[{}]: 轴心 base({:+.3f},{:+.3f}) 前缘 {:.3f} m "
+-                        "后退 {:.0f}mm（{}）底边跨度 {:.0f}mm 影宽 {:.0f}mm 相机高 {:.0f}mm "
+-                        "→ 与掩码法差 {:.0f} mm{}".format(
+-                            cls, gp[0], gp[1], ginfo.get("range_front", 0.0),
+-                            ginfo.get("back", 0.0) * 1000.0, ginfo.get("back_why", ""),
+-                            ginfo.get("jitter", 0.0) * 1000.0,
+-                            ginfo.get("lat_half", 0.0) * 2000.0,
+-                            ginfo.get("cam_h", 0.0) * 1000.0, drift * 1000.0,
+-                            "" if ok_p else "   ✗ {}，本次不采用".format(ginfo.get("why", ""))))
+-                    if self.position_source == "plane" or (
+-                            self.position_source == "auto" and ok_p):
+-                        point = gp
+-                        centroid_tgt = ginfo["front"]
+-                        back = ginfo["back"]
+-                        self.get_logger().info("  → 采用【地面测距】({})".format(
+-                            ginfo.get("back_why", "")))
+-                    else:
+-                        self.get_logger().info("  → 采用【掩码法】（position_source={}）".format(
+-                            self.position_source))
+-                elif self.position_source == "plane":
+-                    self.get_logger().warn("  地面测距[{}]不可用（{}）→ 回退掩码法".format(
+-                        cls, ginfo.get("why", "?")))
++                # （契约点/地面测距/位置源的选取已移到上面的逐帧融合段：每帧各算各的、
++                #   中位数融合；point 即融合结果，代表帧 rep 提供核对与标注所需数据）
+                 tgt = GraspTargetStamped()
+                 tgt.header.frame_id = self.target_frame
+                 tgt.header.stamp = self.get_clock().now().to_msg()   # 本次检测时刻
+@@ -1316,18 +1433,22 @@ class DetectGraspTargetNode(Node):
+ 
+                 msg = ("  {} conf={:.3f} 可见面质心(base)=({:.3f},{:.3f},{:.3f}) "
+                        "实测横向 {} / 竖直 {} 后退 {:.0f}mm → 轴心∩支撑面=({:.3f},{:.3f},{:.3f})"
++                       "【{}帧中位数融合，代表帧 {:d}】"
+                        ).format(
+                     cls, tgt.confidence, centroid_tgt[0], centroid_tgt[1], centroid_tgt[2],
+                     ("{:.3f} m".format(obs) if obs is not None else "n/a"),
+                     ("{:.3f} m".format(obs_h) if obs_h is not None else "n/a"),
+-                    back * 1000, point[0], point[1], point[2])
++                    back * 1000, point[0], point[1], point[2],
++                    len(per_frame), rep["ctx"]["idx"])
+                 self.get_logger().info(msg)
+                 box = d.get("box_xyxy")
+                 if box is not None:
+                     ann_items.append((cls, tgt.confidence, box, point))
+ 
+-            # 标注图（评分要看"框出目标 + 名称"）—— 用这一帧的原图，stamp 与目标一致
+-            self._publish_annotated(bgr, ann_items, img_msg.header.stamp)
++            # 标注图（评分要看"框出目标 + 名称"）—— 用最后一帧的原图，stamp 与那帧一致
++            if frame_ctxs:
++                self._publish_annotated(frame_ctxs[-1]["bgr"], ann_items,
++                                        frame_ctxs[-1]["stamp"])
+ 
+             response.targets.sort(key=lambda t: -t.confidence)
+             response.success = len(response.targets) > 0
+diff --git a/turtlebot3_manipulation_navigation2/scripts/grasp_phase.py b/turtlebot3_manipulation_navigation2/scripts/grasp_phase.py
+index 0530cce..fa582c4 100644
+--- a/turtlebot3_manipulation_navigation2/scripts/grasp_phase.py
++++ b/turtlebot3_manipulation_navigation2/scripts/grasp_phase.py
+@@ -77,11 +77,13 @@ OBSERVATION_DIST = 1.15     # m，观察位到桌心的距离（Nav2 停偏 0.4
+ #   mustard_bottle/sugar_box 能到 0.84 ✓。物体在 640x480 画面里只有几十像素 →
+ #   置信度是【距离】的函数。所以观察位一个都不够格时，再靠近到近看位重看一次。
+ CLOSE_LOOK_DIST = 0.68      # m，近看位到桌心的距离（≈ 桌沿外 0.43 m、离物体 0.7~0.9 m）
+-# ★ 近看位上的【多角度扫视】：单个视场 62° 覆盖不了 1.2 m 长的桌子 ✗
+-#   （实测：观察位处桌子两端 x=2.10/3.30 落在视野外；而罐子在 1.14 m 只有 29×45 像素、
+-#     检测器完全认不出 ✗）→ 走到离桌心 ~0.68 m 后原地转几个角度，每个角度拍一次，
+-#   再把结果按 map 坐标合并（同一物体去重）✓
+-SURVEY_YAWS = (-0.44, 0.0, 0.44)     # rad，±25°；转完并集覆盖约 ±56° ✓
++# ★ 近看位扫视的角度序列：0° 在最前 —— 直拍一帧有目标就不再转（2026-09-18 改：
++#   原来固定跑满 3 个角度 = 3 次视觉调用 ~1 分钟，还把已对正的目标推到 ±25° 的
++#   画面边缘去检测（边缘视角的检测/定位质量都更差）✗）。
++#   ±25° 只是"直拍什么都没有"时的左右补扫：单个视场 62° 覆盖不了 1.2 m 长的桌子
++#   （实测：罐子在 1.14 m 只有 29×45 像素、检测器完全认不出 ✗）；
++#   并集覆盖约 ±56°，1.2 m 桌宽在 0.68 m 处需要 ±41° ✓
++SURVEY_YAWS = (0.0, -0.44, 0.44)     # rad；0° 最前，扫到有目标就停（见 survey_targets）
+ SURVEY_MERGE_DIST = 0.08             # m，map 坐标相距 < 8 cm 视为同一个物体 ✓
+ CLOSE_MIN_CONFIDENCE = 0.25 # 近看这一趟放宽到这里（配合适配层的尺寸核对防误检）
+ 
+@@ -1227,19 +1229,24 @@ class GraspPhase:
+         return rp is not None and abs(self._normalize_angle(target_yaw - rp[2])) < 0.08
+ 
+     def survey_targets(self, yaws=SURVEY_YAWS):
+-        """在当前站位【转几个角度】各检测一次，按 map 坐标合并去重 ✓
++        """近看位扫视：先【正对直拍】一帧，有目标就返回；没有才左右补扫 ✓
+ 
+         为什么要它（实测）：观察位离桌心 1.15 m 时，水平视野 31°（半角）覆盖不到桌子两端 ✗；
+         而小物体（番茄罐 66×101 mm）在 1 m 外只有 ~30 像素、检测器直接认不出 ✗
+-        → 走到近看位（离桌心 0.68 m）再转 ±25° 扫三遍，并集覆盖 ±56°、物体 0.6~0.8 m ✓
++        ★ 2026-09-18 改：原来固定跑满 3 个角度（3 次视觉调用 ~1 分钟），还把已经对正的
++          目标推到 ±25° 的画面边缘去检测 ✗。现在 0° 最前、**扫到有目标就停**：
++          正常情况一次调用完成；±25° 只在直拍什么都没有时才补扫
++          （并集覆盖约 ±56°，1.2 m 桌宽在 0.68 m 处需要 ±41°）
+         合并规则：同类且 map 坐标相距 < SURVEY_MERGE_DIST ⇒ 同一个物体，保留置信度高的那次 ✓
+         返回：换算到**当前**底盘系的 GraspTargetStamped 列表（可直接喂给 choose_target）✓
+         """
+         best = {}       # (class, 约化后的 map 位置) → (conf, map_xy, class)
+         rp_od = self._robot_map_pose()       # ★ 下面算的是 map 坐标 ⇒ 必须用 map 位姿
++        rotated = 0.0                         # 当前已转到的偏航（回正用；没转过就不用回）
+         for i, dyaw in enumerate(yaws):
+             if i > 0:
+                 ok = self._rotate_by(dyaw - yaws[i - 1])
++                rotated = dyaw
+                 self.log.info("  扫视: 转到 {:+.0f}°{}".format(math.degrees(dyaw),
+                                                               "" if ok else "（没转到位，继续）"))
+             rp_od = self._robot_map_pose() or rp_od
+@@ -1264,8 +1271,16 @@ class GraspPhase:
+                     cc, _, cl = best[key]
+                     best[key] = (float(t.confidence), q, cl)
+                     self.log.info("    ↑ {} 更新为 conf={:.2f}".format(t.class_id, t.confidence))
+-        # 转回原朝向（对齐前先归位，免得站位解算用到歪掉的朝向）
+-        if self._rotate_by(-yaws[-1]) is False:
++            if tg:
++                if i == 0:
++                    self.log.info("  正对直拍就有 {} 个目标 → 不再转角补扫 ✓（省 {} 次视觉调用）"
++                                  .format(len(tg), len(yaws) - 1))
++                else:
++                    self.log.info("  {:+.0f}° 补扫到 {} 个目标 → 停止继续扫 ✓".format(
++                        math.degrees(dyaw), len(tg)))
++                break
++        # 转回原朝向（只在真的转过去过时；对齐前先归位，免得站位解算用到歪掉的朝向）
++        if rotated != 0.0 and self._rotate_by(-rotated) is False:
+             self.log.warn("  扫视: 转回原朝向失败（继续）")
+         rp_od = self._robot_map_pose() or rp_od     # ★ 同上：q 是 map 坐标，回换算也要 map 位姿
+         out = []
+@@ -1557,7 +1572,7 @@ class GraspPhase:
+                         self.align_and_approach((TABLE_CENTER_XYZ[0], TABLE_CENTER_XYZ[1]),
+                                                 stand_dist=CLOSE_LOOK_DIST, timeout=15.0)
+                         self.sleep(0.5)
+-                        self.log.info("近看位扫视（转 {} 个角度，单视场覆盖不到整桌 ✓）"
++                        self.log.info("近看位直拍（没目标再左右补扫，最多 {} 个角度）"
+                                       .format(len(SURVEY_YAWS)))
+                         targets = self.survey_targets()
+                         self.last_targets = targets
+@@ -1592,7 +1607,7 @@ class GraspPhase:
+                     prev = self.min_confidence
+                     self.min_confidence = CLOSE_MIN_CONFIDENCE
+                     try:
+-                        self.log.info("近看位扫视（转 {} 个角度）".format(len(SURVEY_YAWS)))
++                        self.log.info("近看位直拍（没目标再左右补扫，最多 {} 个角度）".format(len(SURVEY_YAWS)))
+                         targets = self.survey_targets()
+                         self.last_targets = targets
+                         self.log.info("近看候选 {} 个：{}".format(

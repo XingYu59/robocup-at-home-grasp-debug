@@ -434,6 +434,27 @@ mtc::Task MTCTaskNode::createTask(const GraspRequest& request) {
       RCLCPP_INFO(LOGGER, "  objects.yaml 没给 \"%s\" 的 grasp_lift → 按几何算 %.4f",
                   request.object.class_id.c_str(), lift);
     }
+    // ★ 2026-09-19：无论 lift 是"目录表给的"还是"自己算的"，都夹进可行窗 ✓
+    //   为什么必须有：目录表里写 0.000 的类别（banana/gelatin_box）会被上面的
+    //   "没给"分支重算成 **负值** ⇒ 指尖插进桌面 ⇒ 必然规划失败/撞桌 ✗
+    //   （几何体检：HANDOFF_harness/check_grasp_geometry.py 实测这两个窗是
+    //     [−0.004, 0.009] / [0.001, 0.005]）
+    if (lo <= hi) {
+      const double lift_clamped = std::min(std::max(lift, lo), hi);
+      if (std::abs(lift_clamped - lift) > 1e-9) {
+        RCLCPP_WARN(LOGGER, "  \"%s\" 的 grasp_lift=%.4f 被夹进可行窗口 [%.4f, %.4f] → %.4f ✓",
+                    request.object.class_id.c_str(), lift, lo, hi, lift_clamped);
+        lift = lift_clamped;
+      }
+    } else {
+      // 窗为空（物体太矮）：至少保证指尖不插进桌面 ⇔ lift ≥ kTableMargin + kTipBelowTcp − h2
+      const double lift_floor = kTableMargin + kTipBelowTcp - h2;
+      if (lift < lift_floor) {
+        RCLCPP_WARN(LOGGER, "  \"%s\" 的 grasp_lift=%.4f 低于「指尖不插桌面」的下限 %.4f → 抬到下限",
+                    request.object.class_id.c_str(), lift, lift_floor);
+        lift = lift_floor;
+      }
+    }
     if (lo > hi) {
       RCLCPP_WARN(LOGGER, "  \"%s\" 高 %.3f m：夹持高度窗口为空（物体太矮：指尖会插进桌面）——"
                           "只能尽量靠近上沿",

@@ -451,21 +451,27 @@ def main():
     c = derive_constants(hand)
     print("=" * 96)
     print("手部几何实测（fr3_hand，握爪张开 2×{:.0f} mm）：".format(Q_OPEN * 1000))
+    # ★ 2026-09-19 修：这两个常数本来就量在【物体系、且手摆在 lift=0（指尖平面=箱心）】，
+    #   所以它们**本身就是"指尖平面上方多少毫米"**，不能再减 TCP_Z ✗
+    #   （旧打印减了 TCP_Z ⇒ 打出 6.2 / 66.0 mm 两个假数：前者应为 97.2（中央槽净空），
+    #     后者应为 37.4（手指安装座那一带）—— objects.yaml 的注释里引用的正是 37.4/97 ✓）
     print("  槽内净空（|y| < 40 mm，两指之间、物体插进来的地方）: 指尖平面上方 {:.1f} mm".format(
-        (TCP_Z - c["slot_obj_z"]) * 1000))
+        c["slot_obj_z"] * 1000))
     print("  槽外掌面（|y| > 40 mm，手指安装座那一带）:           指尖平面上方 {:.1f} mm".format(
-        (TCP_Z - c["palm_outer_obj_z"]) * 1000))
+        c["palm_outer_obj_z"] * 1000))
     print("  指腹（橡胶指尖）接触窗：指尖平面上方 {:.1f} mm ~ 下方 {:.1f} mm".format(
         c["tip_top_obj_z"] * 1000, -c["tip_bottom_obj_z"] * 1000))
-    print("  ⇒ 可夹类别（窄边 ≤ 75 mm）整个都在槽里 → 物体顶面可升到指尖平面上方 {:.1f} mm".format(
-        (TCP_Z - c["slot_obj_z"]) * 1000))
+    print("  ⇒ 【物体顶面】最高只能到指尖平面上方 {:.1f} mm（= 手指安装座那一带的净空）".format(
+        c["palm_outer_obj_z"] * 1000))
+    print("     —— 这就是「抓取高度」的几何上限：物体越高，指尖平面就越下不去 ✓")
     print("=" * 96)
 
     objs = load_objects(os.path.join(src_root, "turtlebot3_manipulation_grasp",
                                      "config", "objects.yaml"))
     names = args.classes or list(objs.keys())
-    print("{:>18} {:>5} {:>5} {:>5} | {:>6} {:>4} | {:>6} {:>6} | {:>6} {:>4} | {}".format(
-        "class", "d", "w", "h", "lift", "角", "窗下界", "窗上界", "建议", "角", "结论"))
+    print("{:>18} {:>5} {:>5} {:>5} | {:>6} {:>4} | {:>6} {:>6} | {:6} {:>4} | {:>8} | {}".format(
+        "class", "d", "w", "h", "lift", "角", "窗下界", "窗上界", "建议", "角",
+        "下沿余量", "结论"))
     for name in names:
         if name not in objs:
             print("  ! 目录表里没有 {}".format(name))
@@ -477,10 +483,26 @@ def main():
         near = min(sweep, key=lambda k: abs(k - cur))
         good_now = sweep[near][0]
         rec, rec_ok, (lo, hi) = recommend(o, c, sweep)
+        # ★ 2026-09-19 新增：【下沿余量】= 当前 lift 离"还能用的最低高度"有多少毫米。
+        #   为什么必须看它：手部碰撞网格（fr3_hand）在指尖平面上方只有 37.4 mm
+        #   ⇒ 物体越高，"手不撞物体"的下沿就越靠近当前值；贴着下沿取值时，
+        #   臂执行 ±2 mm / 视觉 z 误差几 mm 就会让手部本体蹭到物体顶面把它推走 ✗
+        #   （potted_meat_can 的 0.004 就只剩 0.4 mm ⇒ 现场"手停在罐顶、合爪空合"）
+        #   余量为负 = 当前值本身不可行（24 个角全撞）✗
+        lower = None
+        for l in sorted(sweep):
+            if sweep[l][0] >= 8:
+                lower = l
+                break
+        marg = None if lower is None else cur - lower
+        marg_s = "-" if marg is None else "{:+.1f}mm".format(marg * 1000.0)
         if not o.get("graspable", True):
             verdict = "— 不可夹（表里 graspable=false，该值不参与抓取）"
         elif good_now >= 8:
             verdict = "✓ 可用（{} 个采样角可行）".format(good_now)
+            if marg is not None and marg < 0.005:
+                verdict += " ⚠ 但贴着下沿（余量 <5 mm）：手部本体离物体顶面太近 ⇒ 建议抬到 {:.3f} ✓".format(
+                    min(lower + 0.005, hi) if lower is not None and hi > lower else cur)
         elif good_now >= 1:
             verdict = "⚠ 只有 {} 个采样角可行（能规划，但对停位/摆放角度敏感）".format(good_now)
         elif rec is None:
@@ -488,9 +510,10 @@ def main():
         else:
             verdict = "✗ 当前值 {:.0f} 个角可行 → 应改成 {:.3f}（{} 个角可行）".format(
                 good_now, rec, rec_ok)
-        print("{:>18} {:5.3f} {:5.3f} {:5.3f} | {:6.3f} {:4d} | {:6.3f} {:6.3f} | {:6} {:4} | {}".format(
-            name, o["depth"], o["width"], o["height"], cur, good_now, lo, hi,
-            "-" if rec is None else "{:.3f}".format(rec), rec_ok, verdict))
+        print("{:>18} {:5.3f} {:5.3f} {:5.3f} | {:6.3f} {:4d} | {:6.3f} {:6.3f} | {:6} {:4} "
+              "| {:>8} | {}".format(
+                  name, o["depth"], o["width"], o["height"], cur, good_now, lo, hi,
+                  "-" if rec is None else "{:.3f}".format(rec), rec_ok, marg_s, verdict))
         if args.sweep:
             for l in sorted(sweep):
                 g, b, t = sweep[l]

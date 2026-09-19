@@ -302,6 +302,25 @@ private:
   bool toRequest(const GraspFixedObject::Request& req, GraspRequest& out, GraspStage& stage, std::string& err) {
     const auto& t = req.target;
 
+    // 0) ★ 2026-09-19：object_yaw_map 支持【运行时注入】（每个请求重读一次）。
+    //    为什么：box_yaw = object_yaw_map − robot_yaw_map(TF/AMCL) ⇒ 合拢轴完全挂在
+    //    AMCL 的偏航上。AMCL 偏航一旦有常量误差 e，两指就沿错误方向合拢；对
+    //    50×97 mm 的罐/薄盒，φ>19.8° 时需要的开口就超过 80 mm ⇒ **几何上夹不进去**：
+    //    两指压在物体顶面把它推走，然后合到指令间距而两指之间是空的
+    //    （2026-09-19 现场"手停在罐顶、夹爪合得宽"就是这个）。
+    //    e 动车站消不掉（车一转 belief 跟着转）⇒ 必须由驱动层用**不依赖 AMCL 的基准**
+    //    （激光扫桌腿）量出来，再写进本参数；这里令 box_yaw = (0+e) − robot_yaw_map
+    //    ⇒ 误差抵消 ✓（推导见 nav 包 grasp_phase.py:_inject_object_yaw）
+    //    注意：本节点启动时读过一次参数，这里必须**重读**，否则注入不生效 ✗
+    if (this->has_parameter("object_yaw_map")) {
+      const double prev = object_yaw_map_;
+      object_yaw_map_ = this->get_parameter("object_yaw_map").get_value<double>();
+      if (std::abs(object_yaw_map_ - prev) > 1e-9) {
+        RCLCPP_WARN(LOGGER, "  object_yaw_map 运行时被改写: %.1f° → %.1f°（用于抵消 AMCL 偏航误差）",
+                    prev * 180.0 / M_PI, object_yaw_map_ * 180.0 / M_PI);
+      }
+    }
+
     // 1) 新鲜度
     const rclcpp::Time stamp(t.header.stamp);
     if (stamp.nanoseconds() != 0) {

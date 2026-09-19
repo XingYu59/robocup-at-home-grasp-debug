@@ -1,0 +1,41 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 基础题（导航 + 视觉识别计数）的【待计数物品清单】—— 一处配置，三处词表联动
+#
+# 什么时候改：裁判开始比赛后会发布**三个物品英文名**（规则书 2.3）。
+#             把下面 count_items 换成那三个 + answer_classes 也换成那三个即可，
+#             其它文件一行都不用改 ✓
+# 怎么生效：改完**重启 patrol_task**（视觉模型加载 ~10 s；节点启动时会打印生效词表 ✓）
+#           VERIFY：日志首行 `视觉流水线就绪 … 词表 ['…','…','…']` 应等于你写的三个 ✓
+#
+# 为什么需要这个文件：原来"待计数物品"硬编码在三处 ✗
+#   ① vision_pipeline.py: ITEM_NAMES / ITEM_ALIASES / TEXT_PROMPT  ← 开集 prompt + 计数集合
+#   ② insid3_review.py:   TARGET_CLASSES                          ← 闭集复核的保留过滤
+#   ③ patrol_task.py:     NAME_TO_JSON / TARGET_CLASSES_JSON       ← 答案 JSON 的类别集合
+#   三处必须同时改（只改一处：只改 ① 复核会把目标剔掉 ✗；只改 ② classify_phrase 会丢弃 ✗）
+#   现在由 scripts/count_items.py 一次性同步 ✓
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ① 要识别/计数/打 Marker 的物品（视觉词表用名；GroundingDINO prompt 与复核标签都用它）
+#    ⚠ 名字必须在闭集参考图里存在：turtlebot3_manipulation_navigation2/scripts/reference_views/
+#       当前有 18 类：apple / banana / beer / bleach_cleanser / bowl / chips_can / coke_can /
+#       cracker_box / gelatin_box / master_chef_can / mustard_bottle / pitcher_base /
+#       potted_meat_can / pudding_box / sugar_box / tomato_soup_can / tuna_fish_can / windex_bottle
+#    （写 "coke can" 或 "coke_can" 都行，内部会归一 ✓）
+count_items:
+  - name: "apple"
+    aliases: ["apple", "red round apple"]
+  - name: "coke can"
+    # 裁判可能说 cola / coke / soda → 都归到这一类 ✓
+    aliases: ["coke", "coca", "cola", "soda", "can"]
+  - name: "bleach_cleanser"
+    aliases: ["bleach", "cleanser"]
+ 
+
+# ② 答案 JSON（<组号>_answer.json）里要出现的类别 —— **必须与裁判发布的写法完全一致，
+#    不能多也不能少**（规则书：类别集合与裁判一致才计分）。留空 = 用 ① 的全部 ✓
+#    写法示例：裁判说 "cola, bowl and windex bottle" → [cola?, ...] 按裁判给的规范名写；
+#    本工程内部规范名见 patrol_task.py 的 NAME_TO_JSON（空格 ↔ 下划线）
+answer_classes: ["apple", "coke_can", "bleach_cleanser"]
+
+# ③ 组号（答案文件名 <组号>_answer.json 用；环境变量 GROUP_NUMBER 可覆盖）
+group_number: 3
